@@ -8,6 +8,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -163,9 +164,35 @@ class AnimeTimmTagger:
             categories_list = json.load(f)
         self._categories = {c["category"]: c["name"] for c in categories_list}
 
+        # Reverse map: category name -> category id
+        self._category_name_to_id = {c["name"]: c["category"] for c in categories_list}
+
         # Load tags
         tags_path = self._download_file("selected_tags.csv")
         self._tags_df = pd.read_csv(tags_path, keep_default_na=False)
+
+        # Precompute numpy arrays for vectorized processing
+        self._tag_names = self._tags_df["name"].values  # np.ndarray of strings
+        self._tag_categories = self._tags_df["category"].values  # np.ndarray of ints
+
+        # Build category masks (boolean arrays)
+        general_cat_id = self._category_name_to_id.get("general", -1)
+        character_cat_id = self._category_name_to_id.get("character", -1)
+        rating_cat_id = self._category_name_to_id.get("rating", -1)
+
+        self._general_mask = self._tag_categories == general_cat_id
+        self._character_mask = self._tag_categories == character_cat_id
+        self._rating_mask = self._tag_categories == rating_cat_id
+
+        # Precompute thresholds array
+        if self.use_best_threshold:
+            self._thresholds = self._tags_df["best_threshold"].values.astype(np.float32)
+        else:
+            # Build threshold array based on category
+            self._thresholds = np.full(len(self._tags_df), 0.4, dtype=np.float32)
+            self._thresholds[self._general_mask] = self.general_threshold or 0.4
+            self._thresholds[self._character_mask] = self.character_threshold or 0.5
+            self._thresholds[self._rating_mask] = self.rating_threshold or 0.4
 
         # Load preprocessing config
         preprocess_path = self._download_file("preprocess.json")
@@ -248,51 +275,96 @@ class AnimeTimmTagger:
             return image.convert("RGB")
 
     def _process_probs(self, probs: torch.Tensor) -> AnimeTimmTagResult:
-        """Process probability tensor into tag result."""
+        """Process probability tensor into tag result (vectorized, single image)."""
         probs_np = probs.cpu().numpy()
 
-        general_tags = {}
-        character_tags = {}
-        rating_tags = {}
+        # Vectorized threshold comparison: [num_tags] > [num_tags] -> [num_tags] bool
+        above_threshold = probs_np >= self._thresholds
 
-        for idx, row in self._tags_df.iterrows():
-            tag_name = row["name"]
-            category = row["category"]
-            prob = float(probs_np[idx])
+        # Extract tags for each category using precomputed masks
+        general_indices = np.where(above_threshold & self._general_mask)[0]
+        character_indices = np.where(above_threshold & self._character_mask)[0]
+        rating_indices = np.where(above_threshold & self._rating_mask)[0]
 
-            # Determine threshold
-            if self.use_best_threshold:
-                threshold = row["best_threshold"]
-            else:
-                category_name = self._categories.get(category, "")
-                if category_name == "general":
-                    threshold = self.general_threshold or 0.4
-                elif category_name == "character":
-                    threshold = self.character_threshold or 0.5
-                elif category_name == "rating":
-                    threshold = self.rating_threshold or 0.4
-                else:
-                    threshold = 0.4
+        # Sort indices by probability descending
+        if len(general_indices) > 0:
+            general_indices = general_indices[np.argsort(-probs_np[general_indices])]
+        if len(character_indices) > 0:
+            character_indices = character_indices[np.argsort(-probs_np[character_indices])]
+        if len(rating_indices) > 0:
+            rating_indices = rating_indices[np.argsort(-probs_np[rating_indices])]
 
-            if prob >= threshold:
-                category_name = self._categories.get(category, "")
-                if category_name == "general":
-                    general_tags[tag_name] = prob
-                elif category_name == "character":
-                    character_tags[tag_name] = prob
-                elif category_name == "rating":
-                    rating_tags[tag_name] = prob
-
-        # Sort by probability descending
-        general_tags = dict(sorted(general_tags.items(), key=lambda x: -x[1]))
-        character_tags = dict(sorted(character_tags.items(), key=lambda x: -x[1]))
-        rating_tags = dict(sorted(rating_tags.items(), key=lambda x: -x[1]))
+        # Build dicts from sorted indices (minimal Python loop over selected tags only)
+        general_tags = {self._tag_names[i]: float(probs_np[i]) for i in general_indices}
+        character_tags = {self._tag_names[i]: float(probs_np[i]) for i in character_indices}
+        rating_tags = {self._tag_names[i]: float(probs_np[i]) for i in rating_indices}
 
         return AnimeTimmTagResult(
             general_tags=general_tags,
             character_tags=character_tags,
             rating_tags=rating_tags,
         )
+
+    def _process_probs_batch(self, batch_probs: torch.Tensor) -> list[AnimeTimmTagResult]:
+        """Process batch of probability tensors (vectorized).
+
+        Args:
+            batch_probs: [batch_size, num_tags] tensor
+
+        Returns:
+            List of AnimeTimmTagResult
+        """
+        # [B, num_tags]
+        probs_np = batch_probs.cpu().numpy()
+        batch_size = probs_np.shape[0]
+
+        # Vectorized threshold comparison: [B, num_tags] >= [num_tags] -> [B, num_tags]
+        above_threshold = probs_np >= self._thresholds  # broadcasts
+
+        # Compute masks for all categories at once: [B, num_tags]
+        general_selected = above_threshold & self._general_mask  # [B, num_tags]
+        character_selected = above_threshold & self._character_mask
+        rating_selected = above_threshold & self._rating_mask
+
+        # For sorting: set non-selected probs to -inf so they sort last
+        NEG_INF = -np.inf
+
+        # Create masked prob arrays for sorting (all at once)
+        general_probs_masked = np.where(general_selected, probs_np, NEG_INF)
+        character_probs_masked = np.where(character_selected, probs_np, NEG_INF)
+        rating_probs_masked = np.where(rating_selected, probs_np, NEG_INF)
+
+        # Get sorted indices (descending) for each category: [B, num_tags]
+        general_sorted_idx = np.argsort(-general_probs_masked, axis=1)
+        character_sorted_idx = np.argsort(-character_probs_masked, axis=1)
+        rating_sorted_idx = np.argsort(-rating_probs_masked, axis=1)
+
+        # Count how many tags are selected per image per category: [B]
+        general_counts = general_selected.sum(axis=1)
+        character_counts = character_selected.sum(axis=1)
+        rating_counts = rating_selected.sum(axis=1)
+
+        # Only loop for final dict construction (unavoidable for variable-length dicts)
+        results = []
+        for b in range(batch_size):
+            # Slice sorted indices up to count (already sorted by prob descending)
+            g_idx = general_sorted_idx[b, :general_counts[b]]
+            c_idx = character_sorted_idx[b, :character_counts[b]]
+            r_idx = rating_sorted_idx[b, :rating_counts[b]]
+
+            # Build dicts using numpy advanced indexing
+            probs_b = probs_np[b]
+            general_tags = dict(zip(self._tag_names[g_idx], probs_b[g_idx].astype(float)))
+            character_tags = dict(zip(self._tag_names[c_idx], probs_b[c_idx].astype(float)))
+            rating_tags = dict(zip(self._tag_names[r_idx], probs_b[r_idx].astype(float)))
+
+            results.append(AnimeTimmTagResult(
+                general_tags=general_tags,
+                character_tags=character_tags,
+                rating_tags=rating_tags,
+            ))
+
+        return results
 
     def tag(
         self,
@@ -326,6 +398,58 @@ class AnimeTimmTagger:
 
         return self._process_probs(probs)
 
+    def preprocess(self, image: Image.Image) -> torch.Tensor:
+        """
+        Preprocess a single PIL image to tensor.
+
+        Args:
+            image: PIL Image (already loaded)
+
+        Returns:
+            Preprocessed tensor (not batched, not on device)
+        """
+        self._load_model()
+        image = self._pil_to_rgb(image)
+        return self._transform(image)
+
+    def preprocess_batch(self, images: list[Image.Image]) -> torch.Tensor:
+        """
+        Preprocess multiple PIL images to a batched tensor.
+
+        Args:
+            images: List of PIL Images (already loaded)
+
+        Returns:
+            Batched tensor ready for inference (not on device yet)
+        """
+        self._load_model()
+        tensors = [self._transform(self._pil_to_rgb(img)) for img in images]
+        return torch.stack(tensors)
+
+    def inference(self, batch_tensor: torch.Tensor) -> list[AnimeTimmTagResult]:
+        """
+        Run inference on preprocessed tensor batch.
+
+        Args:
+            batch_tensor: Preprocessed batched tensor from preprocess_batch()
+
+        Returns:
+            List of AnimeTimmTagResults
+        """
+        self._load_model()
+
+        if self.use_fp16:
+            batch_tensor = batch_tensor.half()
+
+        batch_tensor = batch_tensor.to(self.device)
+
+        with torch.no_grad():
+            output = self._model(batch_tensor)
+            batch_probs = torch.sigmoid(output)
+
+        # Use vectorized batch processing
+        return self._process_probs_batch(batch_probs)
+
     def tag_batch(
         self,
         images: list[Image.Image | str | Path],
@@ -348,27 +472,17 @@ class AnimeTimmTagger:
         for i in range(0, len(images), batch_size):
             batch_images = images[i : i + batch_size]
 
-            # Preprocess
-            tensors = []
+            # Load if paths
+            pil_images = []
             for img in batch_images:
                 if isinstance(img, (str, Path)):
                     img = Image.open(img)
-                img = self._pil_to_rgb(img)
-                tensors.append(self._transform(img))
+                pil_images.append(img)
 
-            batch_tensor = torch.stack(tensors)
-
-            if self.use_fp16:
-                batch_tensor = batch_tensor.half()
-
-            batch_tensor = batch_tensor.to(self.device)
-
-            with torch.no_grad():
-                output = self._model(batch_tensor)
-                batch_probs = torch.sigmoid(output)
-
-            for probs in batch_probs:
-                results.append(self._process_probs(probs))
+            # Preprocess and inference
+            batch_tensor = self.preprocess_batch(pil_images)
+            batch_results = self.inference(batch_tensor)
+            results.extend(batch_results)
 
         return results
 

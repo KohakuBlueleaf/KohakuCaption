@@ -6,9 +6,9 @@ Uses OpenAI SDK with OpenRouter endpoint.
 import logging
 from typing import Any
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, RateLimitError as OpenAIRateLimitError
 
-from kohakucaption.clients.base import ClientConfig, MLLMClient, StatsLogger
+from kohakucaption.clients.base import ClientConfig, MLLMClient, RateLimitError, StatsLogger
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +111,11 @@ class OpenRouterClient(MLLMClient):
 
         logger.debug(f"Sending request with model {self.config.model}")
 
-        response = await self._client.chat.completions.create(**params)
+        try:
+            response = await self._client.chat.completions.create(**params)
+        except OpenAIRateLimitError as e:
+            # Convert to our RateLimitError for special handling
+            raise RateLimitError(str(e)) from e
 
         # Extract content from response
         content = response.choices[0].message.content

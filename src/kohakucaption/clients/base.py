@@ -3,7 +3,9 @@ Base MLLM client with retry logic and monitoring.
 """
 
 import asyncio
+import json
 import logging
+import random
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -19,6 +21,11 @@ from kohakucaption.types import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class RateLimitError(Exception):
+    """Raised when API returns 429 rate limit error."""
+    pass
 
 
 @dataclass
@@ -73,7 +80,6 @@ class StatsLogger:
 
     def _write_to_file(self, stats: RequestStats) -> None:
         """Write stats to log file."""
-        import json
         entry = {
             "request_id": stats.request_id,
             "model": stats.model,
@@ -185,16 +191,37 @@ class MLLMClient(ABC):
         """
         Execute request with retry logic.
 
+        Rate limit errors (429) are retried infinitely with exponential backoff.
+        Other errors respect max_retries limit.
+
         Returns:
             Tuple of (response_content, retries_used)
         """
         max_retries = max_retries if max_retries is not None else self.config.max_retries
         state = RetryState(delay=self.config.retry_delay)
+        rate_limit_retries = 0
 
         while state.attempt <= max_retries:
             try:
                 response = await self._send_request(messages, **kwargs)
-                return response, state.attempt
+                return response, state.attempt + rate_limit_retries
+            except RateLimitError as e:
+                # 429 error: infinite retry with exponential backoff
+                rate_limit_retries += 1
+                # Add jitter to prevent thundering herd
+                jitter = random.uniform(0.5, 1.5)
+                wait_time = min(state.delay * jitter, self.config.retry_max_delay)
+                logger.warning(
+                    f"Rate limited (429). Waiting {wait_time:.1f}s before retry #{rate_limit_retries}..."
+                )
+                await asyncio.sleep(wait_time)
+                # Exponential backoff for rate limit
+                state.delay = min(
+                    state.delay * self.config.retry_multiplier,
+                    self.config.retry_max_delay,
+                )
+                # Don't increment attempt count for rate limit - infinite retry
+                continue
             except Exception as e:
                 state.last_error = str(e)
                 state.attempt += 1

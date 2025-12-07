@@ -3,6 +3,7 @@ Template engine for context formatting.
 Supports simple {variable} substitution with optional formatting.
 """
 
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -62,7 +63,6 @@ class TemplateEngine:
     @staticmethod
     def _format_json(value: Any) -> str:
         """Format value as JSON string."""
-        import json
         return json.dumps(value, ensure_ascii=False)
 
     @staticmethod
