@@ -2,6 +2,7 @@
 temp/
 images/
 pixai-tagger/
+datas/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
