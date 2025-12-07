@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kohaku-caption"
+version = "0.0.1"
+description = "Image caption pipeline"
+authors = [
+    { name = "Shih-Ying Yeh(KohakuBlueLeaf)", email = "apolloyeh0123@gmail.com" },
+]
+license = { text = "Apache-2.0" }
+readme = "README.md"
+requires-python = ">3.10"
+dependencies = [
+    "click",
+    "pydantic>=2.0",
+    "openai>=2.0",
+    "transformers>=4.40",
+    "sentencepiece>=0.2",
+    "torch",
+    "torchvision",
+    "timm",
+    "aiofiles",
+    "pillow",
+    "pandas",
+    "huggingface_hub<1.0",
+]
+urls = { "Homepage" = "https://github.com/KohakuBlueleaf/KohakuCaption" }
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0",
+    "pytest-asyncio>=1.3",
+]
+jsonschema = [
+    "jsonschema>=4.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
