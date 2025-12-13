@@ -79,7 +79,8 @@ def format_scores(result) -> str:
     help="HuggingFace Hub repository ID for the model.",
 )
 @click.option(
-    "--output", "-o",
+    "--output",
+    "-o",
     type=click.Path(dir_okay=False, path_type=Path),
     default=None,
     help="Output file path. If not specified, prints to stdout.",
@@ -109,7 +110,8 @@ def format_scores(result) -> str:
     help="Disable per-tag optimal thresholds. Use fixed thresholds instead.",
 )
 @click.option(
-    "--format", "-f",
+    "--format",
+    "-f",
     "output_format",
     type=click.Choice(["default", "json", "csv", "scores"]),
     default="default",
@@ -123,7 +125,8 @@ def format_scores(result) -> str:
     help="Disable FP16 inference. Use if you encounter precision issues on CPU.",
 )
 @click.option(
-    "--quiet", "-q",
+    "--quiet",
+    "-q",
     is_flag=True,
     default=False,
     help="Only output tags, suppress stats and info messages.",

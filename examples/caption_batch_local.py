@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Batch caption images using local VLM inference (vLLM or LMDeploy).
+Batch caption images using local VLM inference (vLLM).
 
 Output: xxx.cap.json for each xxx.jpg/png/etc.
 
+Uses the DefaultFormat system for structured captions.
 Optionally loads pre-computed tags from xxx.tag.json as context.
 
 Workflow:
@@ -64,55 +65,117 @@ def build_prompt_with_tags(base_prompt: str, tags: dict[str, Any] | None) -> str
         return base_prompt
 
     ctx_lines = []
-    if tags.get("general"):
+    # Handle different tag formats
+    if "general_tags" in tags:
+        if tags.get("general_tags"):
+            tag_list = [t.replace("_", " ") for t in tags["general_tags"]]
+            ctx_lines.append(f"Features: {', '.join(tag_list)}")
+        if tags.get("character_tags"):
+            tag_list = [t.replace("_", " ") for t in tags["character_tags"]]
+            ctx_lines.append(f"Characters: {', '.join(tag_list)}")
+        if tags.get("rating_tags"):
+            tag_list = [t.replace("_", " ") for t in tags["rating_tags"]]
+            ctx_lines.append(f"Rating: {', '.join(tag_list)}")
+    elif tags.get("general"):
         tag_list = [t.replace("_", " ") for t in tags["general"]]
         ctx_lines.append(f"Features: {', '.join(tag_list)}")
-    if tags.get("character"):
-        tag_list = [t.replace("_", " ") for t in tags["character"]]
-        ctx_lines.append(f"Characters: {', '.join(tag_list)}")
-    if tags.get("rating"):
-        tag_list = [t.replace("_", " ") for t in tags["rating"]]
-        ctx_lines.append(f"Rating: {', '.join(tag_list)}")
+        if tags.get("character"):
+            tag_list = [t.replace("_", " ") for t in tags["character"]]
+            ctx_lines.append(f"Characters: {', '.join(tag_list)}")
+        if tags.get("rating"):
+            tag_list = [t.replace("_", " ") for t in tags["rating"]]
+            ctx_lines.append(f"Rating: {', '.join(tag_list)}")
 
     if ctx_lines:
-        return f"{base_prompt}\n\nImage tags:\n" + "\n".join(ctx_lines)
+        return f"{base_prompt}\n\nExisting tags:\n" + "\n".join(ctx_lines)
     return base_prompt
 
 
 @click.command()
-@click.argument("input_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
-@click.option("--output-dir", "-o", type=click.Path(file_okay=False, path_type=Path), default=None,
-              help="Output directory (default: same as input)")
-@click.option("--tag-dir", type=click.Path(file_okay=False, path_type=Path), default=None,
-              help="Directory containing .tag.json files (default: same as input)")
-@click.option("--backend", "-b", type=click.Choice(["vllm", "lmdeploy"]), default="vllm",
-              help="Inference backend")
-@click.option("--model", "-m", type=str, default=None,
-              help="Model name/path")
-@click.option("--tensor-parallel", "-tp", type=int, default=1, show_default=True,
-              help="Number of GPUs for tensor parallelism")
-@click.option("--batch-size", type=int, default=8, show_default=True,
-              help="Batch size for VLM inference")
-@click.option("--max-tokens", type=int, default=512, show_default=True)
+@click.argument(
+    "input_dir", type=click.Path(exists=True, file_okay=False, path_type=Path)
+)
+@click.option(
+    "--output-dir",
+    "-o",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Output directory (default: same as input)",
+)
+@click.option(
+    "--tag-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Directory containing .tag.json files (default: same as input)",
+)
+@click.option(
+    "--model",
+    "-m",
+    type=str,
+    default=None,
+    help="Model name/path. Default: google/gemma-3-4b-it",
+)
+@click.option(
+    "--tensor-parallel",
+    "-tp",
+    type=int,
+    default=1,
+    show_default=True,
+    help="Number of GPUs for tensor parallelism",
+)
+@click.option(
+    "--batch-size",
+    type=int,
+    default=8,
+    show_default=True,
+    help="Batch size for VLM inference",
+)
+@click.option("--max-tokens", type=int, default=2048, show_default=True)
+@click.option(
+    "--max-model-len",
+    type=int,
+    default=8192,
+    show_default=True,
+    help="Maximum model context length",
+)
 @click.option("--temperature", type=float, default=0.7, show_default=True)
-@click.option("--load-tags/--no-load-tags", default=False,
-              help="Load tags from .tag.json files as context")
-@click.option("--num-workers", "-w", type=int, default=4, show_default=True,
-              help="Number of DataLoader workers")
-@click.option("--prefetch", type=int, default=3, show_default=True,
-              help="Number of batches to prefetch")
-@click.option("--extensions", type=str, default=".jpg,.jpeg,.png,.webp", show_default=True)
-@click.option("--skip-existing/--no-skip-existing", default=False,
-              help="Skip images that already have .cap.json files")
+@click.option(
+    "--load-tags/--no-load-tags",
+    default=False,
+    help="Load tags from .tag.json files as context",
+)
+@click.option(
+    "--num-workers",
+    "-w",
+    type=int,
+    default=4,
+    show_default=True,
+    help="Number of DataLoader workers",
+)
+@click.option(
+    "--prefetch",
+    type=int,
+    default=3,
+    show_default=True,
+    help="Number of batches to prefetch",
+)
+@click.option(
+    "--extensions", type=str, default=".jpg,.jpeg,.png,.webp", show_default=True
+)
+@click.option(
+    "--skip-existing/--no-skip-existing",
+    default=False,
+    help="Skip images that already have .cap.json files",
+)
 def main(
     input_dir: Path,
     output_dir: Path | None,
     tag_dir: Path | None,
-    backend: str,
     model: str | None,
     tensor_parallel: int,
     batch_size: int,
     max_tokens: int,
+    max_model_len: int,
     temperature: float,
     load_tags: bool,
     num_workers: int,
@@ -122,6 +185,10 @@ def main(
 ):
     """
     Batch caption images using local VLM inference.
+
+    Uses the DefaultFormat system for structured output with:
+    - aesthetic_score, nsfw_score, quality_score
+    - title, brief, description
 
     \b
     Output format: xxx.cap.json for each image
@@ -139,18 +206,15 @@ def main(
         # With pre-computed tags as context
         python caption_batch_local.py ./images --load-tags
 
-        # Multi-GPU with LMDeploy
-        python caption_batch_local.py ./images -b lmdeploy -tp 4
-
-        # Large model with more GPUs
-        python caption_batch_local.py ./images -m llava-hf/llava-v1.6-34b-hf -tp 4
+        # Multi-GPU with larger model
+        python caption_batch_local.py ./images -m google/gemma-3-12b-it -tp 2
 
     \b
     Workflow:
         1. python tag_batch.py ./images           # Create xxx.tag.json
         2. python caption_batch_local.py ./images --load-tags  # Create xxx.cap.json
     """
-    from kohakucaption.local import PreprocessPipeline
+    from kohakucaption.local import VLLMModel, VLLMConfig, PreprocessPipeline
     from kohakucaption.formats import DefaultFormat
 
     signal.signal(signal.SIGINT, _signal_handler)
@@ -170,43 +234,35 @@ def main(
 
     if skip_existing:
         orig = len(image_paths)
-        image_paths = [p for p in image_paths if not (output_dir / f"{p.stem}.cap.json").exists()]
+        image_paths = [
+            p for p in image_paths if not (output_dir / f"{p.stem}.cap.json").exists()
+        ]
         if orig - len(image_paths) > 0:
             click.echo(f"Skipped {orig - len(image_paths)} existing .cap.json files")
         if not image_paths:
             click.echo("All done.")
             return
 
-    # Default models
+    # Default model
     if model is None:
-        model = "llava-hf/llava-1.5-7b-hf" if backend == "vllm" else "OpenGVLab/InternVL2-8B"
+        model = "google/gemma-3-4b-it"
 
     click.echo("=" * 60)
-    click.echo(f"Backend: {backend} | Model: {model}")
-    click.echo(f"Images: {len(image_paths)} | Batch: {batch_size} | TP: {tensor_parallel}")
+    click.echo(f"Model: {model} | TP: {tensor_parallel}")
+    click.echo(f"Images: {len(image_paths)} | Batch: {batch_size}")
     click.echo(f"Load tags: {load_tags} | Tag dir: {tag_dir if load_tags else 'N/A'}")
     click.echo(f"Output: {{name}}.cap.json")
     click.echo("=" * 60)
 
     # Create VLM model
-    if backend == "vllm":
-        from kohakucaption.local import VLLMModel, VLLMConfig
-        config = VLLMConfig(
-            model=model,
-            tensor_parallel_size=tensor_parallel,
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
-        vlm = VLLMModel(config)
-    else:
-        from kohakucaption.local import LMDeployModel, LMDeployConfig
-        config = LMDeployConfig(
-            model=model,
-            tensor_parallel_size=tensor_parallel,
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
-        vlm = LMDeployModel(config)
+    config = VLLMConfig(
+        model=model,
+        tensor_parallel_size=tensor_parallel,
+        max_tokens=max_tokens,
+        max_model_len=max_model_len,
+        temperature=temperature,
+    )
+    vlm = VLLMModel(config)
 
     # Load VLM
     vlm.load()
@@ -230,7 +286,10 @@ def main(
     start_time = time.time()
 
     try:
-        with pipeline, tqdm(total=len(image_paths), desc="Captioning", unit="img") as pbar:
+        with (
+            pipeline,
+            tqdm(total=len(image_paths), desc="Captioning", unit="img") as pbar,
+        ):
             for batch in pipeline:
                 paths = batch.paths
                 images = batch.images
@@ -245,21 +304,27 @@ def main(
 
                 # Prepare valid images for VLM
                 valid_items = []
-                for i, (path, img, tags, error) in enumerate(zip(paths, images, tags_list, errors)):
+                for i, (path, img, tags, error) in enumerate(
+                    zip(paths, images, tags_list, errors)
+                ):
                     if error or img is None:
                         # Write error
                         data = {"error": error or "Failed to load image"}
-                        with open(output_dir / f"{path.stem}.cap.json", "w", encoding="utf-8") as f:
+                        with open(
+                            output_dir / f"{path.stem}.cap.json", "w", encoding="utf-8"
+                        ) as f:
                             json.dump(data, f, indent=2, ensure_ascii=False)
                         stats["failed"] += 1
                         pbar.update(1)
                     else:
                         prompt = build_prompt_with_tags(base_prompt, tags)
-                        valid_items.append({
-                            "path": path,
-                            "image": img,
-                            "prompt": prompt,
-                        })
+                        valid_items.append(
+                            {
+                                "path": path,
+                                "image": img,
+                                "prompt": prompt,
+                            }
+                        )
 
                 if not valid_items:
                     continue
@@ -301,7 +366,9 @@ def main(
     click.echo()
     click.echo("=" * 60)
     click.echo(f"Done: {stats['success']} OK, {stats['failed']} failed")
-    click.echo(f"Time: {elapsed:.1f}s | Throughput: {(stats['success'] + stats['failed'])/elapsed:.2f} img/s")
+    click.echo(
+        f"Time: {elapsed:.1f}s | Throughput: {(stats['success'] + stats['failed'])/elapsed:.2f} img/s"
+    )
     click.echo("=" * 60)
 
 

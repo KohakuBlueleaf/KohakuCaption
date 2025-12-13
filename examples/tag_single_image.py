@@ -37,7 +37,7 @@ def format_json(result) -> str:
 
 def format_csv(result) -> str:
     """Format as comma-separated tags."""
-    return ', '.join(result.all_tags())
+    return ", ".join(result.all_tags())
 
 
 @click.command()
@@ -53,7 +53,8 @@ def format_csv(result) -> str:
     help="Directory containing PixAI tagger model files (model_v0.9.pth, tags_v0.9_13k.json, char_ip_map.json).",
 )
 @click.option(
-    "--output", "-o",
+    "--output",
+    "-o",
     type=click.Path(dir_okay=False, path_type=Path),
     default=None,
     help="Output file path. If not specified, prints to stdout.",
@@ -73,7 +74,8 @@ def format_csv(result) -> str:
     help="Confidence threshold for character tags. Higher = more confident matches only.",
 )
 @click.option(
-    "--format", "-f",
+    "--format",
+    "-f",
     "output_format",
     type=click.Choice(["default", "json", "csv"]),
     default="default",
@@ -87,7 +89,8 @@ def format_csv(result) -> str:
     help="Disable FP16 inference. Use if you encounter precision issues on CPU.",
 )
 @click.option(
-    "--quiet", "-q",
+    "--quiet",
+    "-q",
     is_flag=True,
     default=False,
     help="Only output tags, suppress stats and info messages.",

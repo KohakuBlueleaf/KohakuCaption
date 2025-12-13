@@ -112,21 +112,56 @@ def format_tags_result(result, include_scores: bool = True) -> dict:
 
 
 @click.command()
-@click.argument("input_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
-@click.option("--output-dir", "-o", type=click.Path(file_okay=False, path_type=Path), default=None,
-              help="Output directory (default: same as input)")
-@click.option("--tagger-repo", type=str, default=DEFAULT_TAGGER_REPO, show_default=True,
-              help="HuggingFace repo ID for tagger model")
-@click.option("--batch-size", "-b", type=int, default=16, show_default=True,
-              help="Batch size for tagger inference")
-@click.option("--num-workers", "-w", type=int, default=4, show_default=True,
-              help="Number of DataLoader workers")
-@click.option("--extensions", type=str, default=".jpg,.jpeg,.png,.webp", show_default=True,
-              help="Image file extensions to process")
-@click.option("--skip-existing/--no-skip-existing", default=False,
-              help="Skip images that already have .tag.json files")
-@click.option("--include-scores/--no-scores", default=True,
-              help="Include confidence scores in output")
+@click.argument(
+    "input_dir", type=click.Path(exists=True, file_okay=False, path_type=Path)
+)
+@click.option(
+    "--output-dir",
+    "-o",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Output directory (default: same as input)",
+)
+@click.option(
+    "--tagger-repo",
+    type=str,
+    default=DEFAULT_TAGGER_REPO,
+    show_default=True,
+    help="HuggingFace repo ID for tagger model",
+)
+@click.option(
+    "--batch-size",
+    "-b",
+    type=int,
+    default=16,
+    show_default=True,
+    help="Batch size for tagger inference",
+)
+@click.option(
+    "--num-workers",
+    "-w",
+    type=int,
+    default=4,
+    show_default=True,
+    help="Number of DataLoader workers",
+)
+@click.option(
+    "--extensions",
+    type=str,
+    default=".jpg,.jpeg,.png,.webp",
+    show_default=True,
+    help="Image file extensions to process",
+)
+@click.option(
+    "--skip-existing/--no-skip-existing",
+    default=False,
+    help="Skip images that already have .tag.json files",
+)
+@click.option(
+    "--include-scores/--no-scores",
+    default=True,
+    help="Include confidence scores in output",
+)
 def main(
     input_dir: Path,
     output_dir: Path | None,
@@ -179,7 +214,9 @@ def main(
 
     if skip_existing:
         orig = len(image_paths)
-        image_paths = [p for p in image_paths if not (output_dir / f"{p.stem}.tag.json").exists()]
+        image_paths = [
+            p for p in image_paths if not (output_dir / f"{p.stem}.tag.json").exists()
+        ]
         skipped = orig - len(image_paths)
         if skipped > 0:
             click.echo(f"Skipped {skipped} existing .tag.json files")
@@ -250,7 +287,9 @@ def main(
     click.echo()
     click.echo("=" * 60)
     click.echo(f"Done: {stats['success']} OK, {stats['failed']} failed")
-    click.echo(f"Time: {elapsed:.1f}s | Throughput: {len(image_paths)/elapsed:.1f} img/s")
+    click.echo(
+        f"Time: {elapsed:.1f}s | Throughput: {len(image_paths)/elapsed:.1f} img/s"
+    )
     click.echo("=" * 60)
 
 

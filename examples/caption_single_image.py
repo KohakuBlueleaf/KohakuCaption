@@ -52,13 +52,15 @@ def get_default_model(provider: str) -> str:
     type=str,
 )
 @click.option(
-    "--provider", "-p",
+    "--provider",
+    "-p",
     type=click.Choice(["openai", "openrouter"]),
     default="openai",
     help="API provider to use for captioning.",
 )
 @click.option(
-    "--model", "-m",
+    "--model",
+    "-m",
     type=str,
     default=None,
     help="Model to use. Defaults to gpt-4o (OpenAI) or openai/gpt-4o (OpenRouter).",
@@ -71,7 +73,8 @@ def get_default_model(provider: str) -> str:
     help="API key. Can also be set via OPENAI_API_KEY or OPENROUTER_API_KEY env vars.",
 )
 @click.option(
-    "--output", "-o",
+    "--output",
+    "-o",
     type=click.Path(dir_okay=False, path_type=Path),
     default=None,
     help="Output file path. If not specified, prints to stdout.",
@@ -153,18 +156,20 @@ def main(
         - TOKEN COUNTS: Token counts per field (if tokenizer enabled)
         - STATS: Request statistics (retries, latency)
     """
-    asyncio.run(_async_main(
-        image=image,
-        provider=provider,
-        model=model,
-        api_key=api_key,
-        output=output,
-        detail=detail,
-        max_retries=max_retries,
-        timeout=timeout,
-        tokenizer=tokenizer,
-        validation_retries=validation_retries,
-    ))
+    asyncio.run(
+        _async_main(
+            image=image,
+            provider=provider,
+            model=model,
+            api_key=api_key,
+            output=output,
+            detail=detail,
+            max_retries=max_retries,
+            timeout=timeout,
+            tokenizer=tokenizer,
+            validation_retries=validation_retries,
+        )
+    )
 
 
 async def _async_main(
@@ -298,7 +303,7 @@ async def _async_main(
                 last_error = parse_result.error
                 click.echo(
                     f"Validation failed (attempt {attempt + 1}/{validation_retries}): {last_error}",
-                    err=True
+                    err=True,
                 )
         else:
             # All attempts failed
