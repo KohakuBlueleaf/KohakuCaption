@@ -1,5 +1,7 @@
 """
 MLLM API clients for image captioning.
+
+For local inference, use the `kohakucaption.local` module instead.
 """
 
 from kohakucaption.clients.base import ClientConfig, MLLMClient, RateLimitError

@@ -59,6 +59,8 @@ class DefaultFormat(OutputFormat):
         lines.append("- Value goes on the next line(s) until the next # or end")
         lines.append("- No extra formatting, no markdown, no JSON")
         lines.append("- Write in direct declarative sentences, never use 'this image shows' or similar")
+        lines.append("- Cover ALL visual elements: subjects, actions, background, lighting, colors, style")
+        lines.append("- If nsfw_score > 0.3, describe explicit content in detail")
 
         return "\n".join(lines)
 
