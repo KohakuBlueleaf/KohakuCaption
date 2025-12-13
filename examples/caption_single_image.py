@@ -25,12 +25,7 @@ from kohakucaption.types import ImageInput
 
 CAPTION_PROMPT_TEMPLATE = """Provide a structured caption for this image.
 
-{format_instruction}
-
-Additional requirements:
-- Cover ALL visual elements: subjects, attributes, actions, background, environment, lighting, colors, composition, artistic style
-- Never omit background or secondary elements
-- If nsfw_score > 0.3, describe explicit/sexual content in detail"""
+{format_instruction}"""
 
 
 def get_api_key(provider: str, api_key: str | None) -> str:

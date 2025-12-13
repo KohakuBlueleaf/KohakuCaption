@@ -732,11 +732,7 @@ def main(
     output_format = DefaultFormat()
     prompt = f"""Provide a structured caption for this image.
 
-{output_format.get_format_instruction()}
-
-Requirements:
-- Cover ALL visual elements
-- If nsfw_score > 0.3, describe explicit content"""
+{output_format.get_format_instruction()}"""
 
     try:
         stats = process_batch_caption(
