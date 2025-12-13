@@ -13,7 +13,8 @@ import click
 
 @click.command()
 @click.option(
-    "--output-dir", "-o",
+    "--output-dir",
+    "-o",
     type=click.Path(file_okay=False, dir_okay=True, path_type=Path),
     default=Path("pixai-tagger"),
     show_default=True,
@@ -110,7 +111,9 @@ def main(output_dir: Path, repo_id: str, force: bool):
             click.echo(click.style("Note: This is a gated model.", fg="yellow"))
             click.echo("Make sure you have:")
             click.echo("  1. A HuggingFace account")
-            click.echo(f"  2. Accepted the license at: https://huggingface.co/{repo_id}")
+            click.echo(
+                f"  2. Accepted the license at: https://huggingface.co/{repo_id}"
+            )
             click.echo("  3. Logged in with: huggingface-cli login")
             sys.exit(1)
 
@@ -129,7 +132,9 @@ def _print_usage(output_dir: Path):
     click.echo('  result = tagger.tag("image.png")')
     click.echo()
     click.echo("Or via CLI:")
-    click.echo(f"  python examples/tag_single_image.py image.png --tagger-dir {output_dir}")
+    click.echo(
+        f"  python examples/tag_single_image.py image.png --tagger-dir {output_dir}"
+    )
 
 
 if __name__ == "__main__":

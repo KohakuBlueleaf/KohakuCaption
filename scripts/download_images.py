@@ -62,7 +62,7 @@ def get_filename_from_url(url: str, index: int) -> str:
     if "/" in path:
         filename = path.split("/")[-1]
         # Clean up and validate
-        filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
+        filename = re.sub(r'[<>:"/\\|?*]', "_", filename)
         if filename and "." in filename:
             return filename
 
@@ -140,13 +140,15 @@ async def process_url_file(
     type=click.Path(exists=True, path_type=Path),
 )
 @click.option(
-    "--output-dir", "-o",
+    "--output-dir",
+    "-o",
     type=click.Path(file_okay=False, path_type=Path),
     default=None,
     help="Base output directory. Defaults to same directory as input.",
 )
 @click.option(
-    "--max-concurrent", "-c",
+    "--max-concurrent",
+    "-c",
     type=int,
     default=5,
     show_default=True,
@@ -165,7 +167,8 @@ async def process_url_file(
     help="Use original filenames from URLs instead of numbered (0001.jpg, etc.).",
 )
 @click.option(
-    "--quiet", "-q",
+    "--quiet",
+    "-q",
     is_flag=True,
     help="Only show summary, not individual downloads.",
 )

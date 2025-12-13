@@ -2,48 +2,44 @@
 """
 ImageNet-1k Local Captioning Script.
 
-Reads images from a tagged folder (output of imagenet_tagging.py) and generates captions.
-Optionally includes tags as context for the captioning model.
+Reads images from a tagged folder (output of imagenet_tagging.py) and generates captions
+using vLLM with proper format system (DefaultFormat).
 
 Input folder structure:
     <id>.jpg        - The image
     <id>.tag.json   - Tags and metadata (from tagging script)
 
 Output:
-    <id>.caption.json - Generated caption
+    <id>.caption.json - Generated caption with structured fields
 
-Supports multi-GPU inference with:
-  - Data Parallelism: Multiple model replicas on different GPUs (default)
-  - Tensor Parallelism: Single model sharded across GPUs (for large models)
+Supports multi-GPU via --gpus flag (spawns subprocesses with correct CUDA_VISIBLE_DEVICES).
 
 Usage:
-    # Data parallel on 4 GPUs (recommended for smaller models)
-    python scripts/imagenet_captioning.py -i ./imagenet_data --gpus 0,1,2,3
-
-    # With tags as context
-    python scripts/imagenet_captioning.py -i ./imagenet_data --gpus 0,1,2,3 --with-tags
-
-    # Tensor parallel on 4 GPUs (for large models like 34B)
-    python scripts/imagenet_captioning.py -i ./imagenet_data --tensor-parallel 4
-
     # Single GPU
     python scripts/imagenet_captioning.py -i ./imagenet_data --gpus 0
+
+    # Multi-GPU (4 GPUs)
+    python scripts/imagenet_captioning.py -i ./imagenet_data --gpus 0,3,4,5
+
+    # With tags as context
+    python scripts/imagenet_captioning.py -i ./imagenet_data --gpus 0,3,4,5 --with-tags
+
+    # Tensor parallel (single large model across GPUs)
+    python scripts/imagenet_captioning.py -i ./imagenet_data --tensor-parallel 4
 """
 
 import json
 import logging
-import multiprocessing as mp
 import os
-import queue
 import signal
+import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from collections import deque
 from pathlib import Path
 from typing import Any
 
 import click
-import torch
 
 # Add src to path for local development
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -61,7 +57,6 @@ logger = logging.getLogger(__name__)
 
 # Silence noisy loggers
 logging.getLogger("vllm").setLevel(logging.WARNING)
-logging.getLogger("lmdeploy").setLevel(logging.WARNING)
 
 # Global interrupt flag
 _interrupted = False
@@ -73,50 +68,8 @@ def _signal_handler(signum, frame):
     _interrupted = True
 
 
-# Default models for different backends
-DEFAULT_MODELS = {
-    "vllm": "llava-hf/llava-1.5-7b-hf",
-    "lmdeploy": "OpenGVLab/InternVL2-8B",
-}
-
-# Caption prompts
-DEFAULT_PROMPT = """Describe this image in detail. Include:
-1. Main subjects and their characteristics
-2. Actions or activities
-3. Setting and environment
-4. Colors, lighting, and mood
-5. Any notable details
-
-Provide a comprehensive description in 2-3 sentences."""
-
-PROMPT_WITH_TAGS = """Describe this image in detail. The following tags have been detected:
-
-{tags}
-
-Using these tags as guidance, provide a comprehensive description that covers:
-1. Main subjects and their characteristics
-2. Actions or activities
-3. Setting and environment
-4. Colors, lighting, and mood
-
-Provide a detailed description in 2-3 sentences."""
-
-
-@dataclass
-class CaptionTask:
-    """Task for captioning worker."""
-    image_id: str
-    image_path: Path
-    tag_path: Path
-    tags: dict[str, Any] | None
-
-
-@dataclass
-class CaptionResult:
-    """Result from captioning worker."""
-    image_id: str
-    caption: str | None
-    error: str | None = None
+# Default model
+DEFAULT_MODEL = "google/gemma-3-4b-it"
 
 
 def pil_to_rgb(image: Image.Image) -> Image.Image:
@@ -135,35 +88,13 @@ def pil_to_rgb(image: Image.Image) -> Image.Image:
         return image.convert("RGB")
 
 
-def format_tags_for_prompt(tags: dict[str, Any]) -> str:
-    """Format tags dict into a string for the prompt."""
-    parts = []
-
-    general = tags.get("general_tags", [])
-    if general:
-        # Replace underscores with spaces
-        formatted = [t.replace("_", " ") for t in general[:30]]  # Limit to top 30
-        parts.append(f"Features: {', '.join(formatted)}")
-
-    characters = tags.get("character_tags", [])
-    if characters:
-        formatted = [t.replace("_", " ") for t in characters]
-        parts.append(f"Characters: {', '.join(formatted)}")
-
-    rating = tags.get("rating_tags", [])
-    if rating:
-        parts.append(f"Rating: {rating[0].replace('_', ' ')}")
-
-    return "\n".join(parts) if parts else "No tags detected"
-
-
 class SpeedMonitor:
     """Monitor processing speed with moving average."""
 
     def __init__(self, window_size: int = 50):
-        from collections import deque
         self.timestamps: deque[float] = deque(maxlen=window_size)
         self.counts: deque[int] = deque(maxlen=window_size)
+        self.start_time = time.time()
         self.total_count = 0
 
     def tick(self, count: int = 1):
@@ -199,12 +130,15 @@ def find_images(input_dir: Path) -> list[tuple[str, Path, Path]]:
     results = []
 
     # Find all tag.json files
-    for tag_path in sorted(input_dir.glob("*.tag.json")):
-        image_id = tag_path.stem.replace(".tag", "")
+    tag_files = sorted(input_dir.glob("*.tag.json"))
+
+    for tag_path in tag_files:
+        # Extract image ID from tag filename
+        image_id = tag_path.name.replace(".tag.json", "")
 
         # Find corresponding image
         image_path = None
-        for ext in [".jpg", ".jpeg", ".png", ".webp"]:
+        for ext in [".jpg", ".jpeg", ".png", ".webp", ".JPEG", ".JPG", ".PNG"]:
             candidate = input_dir / f"{image_id}{ext}"
             if candidate.exists():
                 image_path = candidate
@@ -216,281 +150,303 @@ def find_images(input_dir: Path) -> list[tuple[str, Path, Path]]:
     return results
 
 
-def worker_process_vllm(
-    gpu_id: int,
-    model_name: str,
-    task_queue: mp.Queue,
-    result_queue: mp.Queue,
-    base_prompt: str,
+def build_prompt_with_tags(base_prompt: str, tags: dict[str, Any] | None) -> str:
+    """Build prompt with optional tags context."""
+    if not tags:
+        return base_prompt
+
+    ctx_lines = []
+
+    # Handle different tag formats
+    if "general_tags" in tags:
+        # Format from batch_caption.py tagger
+        if tags.get("general_tags"):
+            tag_list = [t.replace("_", " ") for t in tags["general_tags"]]
+            ctx_lines.append(f"Features: {', '.join(tag_list)}")
+        if tags.get("character_tags"):
+            tag_list = [t.replace("_", " ") for t in tags["character_tags"]]
+            ctx_lines.append(f"Characters: {', '.join(tag_list)}")
+        if tags.get("rating_tags"):
+            tag_list = [t.replace("_", " ") for t in tags["rating_tags"]]
+            ctx_lines.append(f"Rating: {', '.join(tag_list)}")
+    elif "tags" in tags:
+        # Format from imagenet_tagging.py
+        tag_data = tags["tags"]
+        if isinstance(tag_data, dict):
+            if tag_data.get("general"):
+                tag_list = [t.replace("_", " ") for t in tag_data["general"]]
+                ctx_lines.append(f"Features: {', '.join(tag_list)}")
+            if tag_data.get("character"):
+                tag_list = [t.replace("_", " ") for t in tag_data["character"]]
+                ctx_lines.append(f"Characters: {', '.join(tag_list)}")
+            if tag_data.get("rating"):
+                tag_list = [t.replace("_", " ") for t in tag_data["rating"]]
+                ctx_lines.append(f"Rating: {', '.join(tag_list)}")
+
+    if ctx_lines:
+        return f"{base_prompt}\n\nExisting tags:\n" + "\n".join(ctx_lines)
+    return base_prompt
+
+
+def run_worker_subprocess(
+    gpu_id: str,
+    rank: int,
+    world_size: int,
+    input_dir: Path,
+    model: str,
     with_tags: bool,
+    batch_size: int,
     max_tokens: int,
+    max_model_len: int,
     temperature: float,
-):
-    """
-    Worker process for vLLM inference on a single GPU (data parallel mode).
-    """
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    max_samples: int | None,
+    skip_existing: bool,
+) -> subprocess.Popen:
+    """Spawn a worker subprocess with CUDA_VISIBLE_DEVICES set."""
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = gpu_id
 
-    try:
-        from kohakucaption.local.vllm import VLLMModel, VLLMConfig
+    cmd = [
+        sys.executable,
+        __file__,
+        "-i",
+        str(input_dir),
+        "--gpus",
+        gpu_id,  # Single GPU
+        "--model",
+        model,
+        "--batch-size",
+        str(batch_size),
+        "--max-tokens",
+        str(max_tokens),
+        "--max-model-len",
+        str(max_model_len),
+        "--temperature",
+        str(temperature),
+        "--worker-rank",
+        str(rank),
+        "--worker-world-size",
+        str(world_size),
+    ]
 
-        config = VLLMConfig(
-            model=model_name,
-            tensor_parallel_size=1,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            gpu_memory_utilization=0.85,
-        )
+    if with_tags:
+        cmd.append("--with-tags")
+    if not skip_existing:
+        cmd.append("--no-skip-existing")
+    if max_samples is not None:
+        cmd.extend(["--max-samples", str(max_samples)])
 
-        logger.info(f"[GPU {gpu_id}] Loading vLLM model: {model_name}")
-        model = VLLMModel(config)
-        model.load()
-        logger.info(f"[GPU {gpu_id}] Model loaded successfully")
-
-        while True:
-            try:
-                task = task_queue.get(timeout=1.0)
-            except queue.Empty:
-                continue
-
-            if task is None:  # Shutdown signal
-                break
-
-            try:
-                # Load image
-                image = Image.open(task.image_path)
-                image_rgb = pil_to_rgb(image)
-
-                # Build prompt
-                if with_tags and task.tags:
-                    tags_str = format_tags_for_prompt(task.tags)
-                    prompt = PROMPT_WITH_TAGS.format(tags=tags_str)
-                else:
-                    prompt = base_prompt
-
-                output = model.generate(image_rgb, prompt)
-
-                result_queue.put(CaptionResult(
-                    image_id=task.image_id,
-                    caption=output.text,
-                ))
-            except Exception as e:
-                result_queue.put(CaptionResult(
-                    image_id=task.image_id,
-                    caption=None,
-                    error=str(e),
-                ))
-
-        model.unload()
-
-    except Exception as e:
-        logger.error(f"[GPU {gpu_id}] Worker failed: {e}")
-        import traceback
-        traceback.print_exc()
+    return subprocess.Popen(cmd, env=env)
 
 
-def worker_process_lmdeploy(
-    gpu_id: int,
-    model_name: str,
-    task_queue: mp.Queue,
-    result_queue: mp.Queue,
-    base_prompt: str,
-    with_tags: bool,
-    max_tokens: int,
-    temperature: float,
-):
-    """
-    Worker process for LMDeploy inference on a single GPU (data parallel mode).
-    """
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-
-    try:
-        from kohakucaption.local.lmdeploy import LMDeployModel, LMDeployConfig
-
-        config = LMDeployConfig(
-            model=model_name,
-            tensor_parallel_size=1,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            backend="turbomind",
-        )
-
-        logger.info(f"[GPU {gpu_id}] Loading LMDeploy model: {model_name}")
-        model = LMDeployModel(config)
-        model.load()
-        logger.info(f"[GPU {gpu_id}] Model loaded successfully")
-
-        while True:
-            try:
-                task = task_queue.get(timeout=1.0)
-            except queue.Empty:
-                continue
-
-            if task is None:
-                break
-
-            try:
-                image = Image.open(task.image_path)
-                image_rgb = pil_to_rgb(image)
-
-                if with_tags and task.tags:
-                    tags_str = format_tags_for_prompt(task.tags)
-                    prompt = PROMPT_WITH_TAGS.format(tags=tags_str)
-                else:
-                    prompt = base_prompt
-
-                output = model.generate(image_rgb, prompt)
-
-                result_queue.put(CaptionResult(
-                    image_id=task.image_id,
-                    caption=output.text,
-                ))
-            except Exception as e:
-                result_queue.put(CaptionResult(
-                    image_id=task.image_id,
-                    caption=None,
-                    error=str(e),
-                ))
-
-        model.unload()
-
-    except Exception as e:
-        logger.error(f"[GPU {gpu_id}] Worker failed: {e}")
-        import traceback
-        traceback.print_exc()
-
-
-def process_data_parallel(
+def process_batch(
     image_items: list[tuple[str, Path, Path]],
     input_dir: Path,
-    gpu_ids: list[int],
     model_name: str,
-    backend: str,
     base_prompt: str,
+    output_format,
     with_tags: bool,
+    batch_size: int,
     max_tokens: int,
+    max_model_len: int,
     temperature: float,
-    prefetch: int,
+    rank: int,
+    world_size: int,
 ) -> dict[str, int]:
     """
-    Process with data parallelism (multiple model copies).
+    Process images in batches using vLLM's batch inference.
+
+    If world_size > 1, only processes items[rank::world_size].
     """
     global _interrupted
+    from kohakucaption.local.vllm import VLLMModel, VLLMConfig
+
+    # Shard data if multi-GPU
+    if world_size > 1:
+        my_items = image_items[rank::world_size]
+    else:
+        my_items = image_items
+
+    if not my_items:
+        return {"success": 0, "failed": 0}
 
     stats = {"success": 0, "failed": 0}
     speed = SpeedMonitor()
-    total = len(image_items)
+    total = len(my_items)
 
-    # Create queues
-    task_queue = mp.Queue(maxsize=prefetch * len(gpu_ids))
-    result_queue = mp.Queue()
+    # Load model
+    config = VLLMConfig(
+        model=model_name,
+        tensor_parallel_size=1,
+        max_tokens=max_tokens,
+        max_model_len=max_model_len,
+        temperature=temperature,
+        gpu_memory_utilization=0.9,
+    )
+    model = VLLMModel(config)
 
-    # Select worker function
-    worker_fn = worker_process_vllm if backend == "vllm" else worker_process_lmdeploy
+    gpu_id = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+    logger.info(f"[GPU {gpu_id}] Loading model: {model_name}")
+    model.load()
+    logger.info(f"[GPU {gpu_id}] Model loaded")
 
-    # Start workers
-    workers = []
-    for gpu_id in gpu_ids:
-        p = mp.Process(
-            target=worker_fn,
-            args=(gpu_id, model_name, task_queue, result_queue, base_prompt,
-                  with_tags, max_tokens, temperature),
-        )
-        p.start()
-        workers.append(p)
-
-    logger.info(f"Started {len(workers)} workers on GPUs: {gpu_ids}")
-
-    pbar = tqdm(total=total, desc="Captioning", unit="img")
-    submitted = 0
-    completed = 0
+    pbar = tqdm(
+        total=total,
+        desc=f"[GPU {gpu_id}] Captioning",
+        unit="img",
+        position=rank,
+    )
 
     def update_pbar():
-        remaining = total - completed
+        remaining = total - (stats["success"] + stats["failed"])
         pbar.set_postfix_str(
             f"{speed.get_speed():.2f}/s ETA:{speed.get_eta(remaining)} "
-            f"| Q:{submitted - completed} | OK:{stats['success']} ERR:{stats['failed']}"
+            f"| OK:{stats['success']} ERR:{stats['failed']}"
         )
 
     try:
-        item_iter = iter(image_items)
-        done_submitting = False
+        # Process in batches
+        for batch_start in range(0, total, batch_size):
+            if _interrupted:
+                break
 
-        while completed < total and not _interrupted:
-            # Submit tasks
-            while submitted < total and not done_submitting:
+            batch_end = min(batch_start + batch_size, total)
+            batch_items = my_items[batch_start:batch_end]
+
+            # Load batch images and build prompts
+            batch_images = []
+            batch_prompts = []
+            batch_ids = []
+            batch_errors = []
+
+            for image_id, image_path, tag_path in batch_items:
                 try:
-                    image_id, image_path, tag_path = next(item_iter)
+                    # Load image
+                    image = Image.open(image_path)
+                    image_rgb = pil_to_rgb(image)
+                    batch_images.append(image_rgb)
+                    batch_ids.append(image_id)
 
-                    # Load tags if needed
-                    tags = None
+                    # Build prompt with tags if enabled
                     if with_tags and tag_path.exists():
                         try:
                             with open(tag_path, "r", encoding="utf-8") as f:
                                 tag_data = json.load(f)
-                                tags = tag_data.get("tags")
+                            prompt = build_prompt_with_tags(base_prompt, tag_data)
                         except Exception:
-                            pass
+                            prompt = base_prompt
+                    else:
+                        prompt = base_prompt
 
-                    task = CaptionTask(
-                        image_id=image_id,
-                        image_path=image_path,
-                        tag_path=tag_path,
-                        tags=tags,
-                    )
-                    task_queue.put_nowait(task)
-                    submitted += 1
-                except StopIteration:
-                    done_submitting = True
-                    break
-                except queue.Full:
-                    break
+                    batch_prompts.append(prompt)
+                    batch_errors.append(None)
 
-            # Collect results
-            try:
-                result = result_queue.get(timeout=0.1)
+                except Exception as e:
+                    batch_errors.append(str(e))
+                    batch_ids.append(image_id)
 
-                # Save caption
-                caption_path = input_dir / f"{result.image_id}.caption.json"
-                data = {"image_id": result.image_id}
+            # Filter out errors for batch inference
+            valid_indices = [i for i, e in enumerate(batch_errors) if e is None]
 
-                if result.error:
-                    data["error"] = result.error
+            if valid_indices:
+                valid_images = [batch_images[i] for i in range(len(batch_images))]
+                valid_prompts = [batch_prompts[i] for i in range(len(batch_prompts))]
+
+                # Batch inference with vLLM - with error handling for CUDA errors
+                try:
+                    batch_output = model.generate_batch(valid_images, valid_prompts)
+                    batch_success = True
+                except Exception as e:
+                    error_msg = str(e)
+                    is_cuda_error = "CUDA" in error_msg or "cuda" in error_msg
+
+                    if is_cuda_error:
+                        logger.error(
+                            f"[GPU {gpu_id}] CUDA error during batch inference: {error_msg[:200]}"
+                        )
+                        logger.error(
+                            f"[GPU {gpu_id}] Marking {len(valid_images)} items as failed. "
+                            f"Restart with --skip-existing to continue."
+                        )
+                    else:
+                        logger.error(
+                            f"[GPU {gpu_id}] Batch inference error: {error_msg[:200]}"
+                        )
+
+                    # Mark all items in this batch as failed
+                    for image_id in batch_ids:
+                        caption_path = input_dir / f"{image_id}.caption.json"
+                        data = {
+                            "image_id": image_id,
+                            "error": f"Batch inference failed: {error_msg[:500]}",
+                        }
+                        with open(caption_path, "w", encoding="utf-8") as f:
+                            json.dump(data, f, indent=2, ensure_ascii=False)
+                        stats["failed"] += 1
+
+                    batch_success = False
+
+                    # For CUDA errors, we should stop as the GPU state may be corrupted
+                    if is_cuda_error:
+                        logger.error(
+                            f"[GPU {gpu_id}] Stopping due to CUDA error. "
+                            f"Restart with --skip-existing to resume."
+                        )
+                        _interrupted = True
+                        break
+
+                if batch_success:
+                    # Process results
+                    valid_idx = 0
+                    for i, (image_id, error) in enumerate(zip(batch_ids, batch_errors)):
+                        caption_path = input_dir / f"{image_id}.caption.json"
+
+                        if error:
+                            # Write error
+                            data = {"image_id": image_id, "error": error}
+                            stats["failed"] += 1
+                        else:
+                            # Parse output
+                            gen_output = batch_output.outputs[valid_idx]
+                            valid_idx += 1
+
+                            parse_result = output_format.parse(gen_output.text)
+                            if parse_result.success:
+                                data = {
+                                    "image_id": image_id,
+                                    "caption": parse_result.data,
+                                }
+                                stats["success"] += 1
+                            else:
+                                data = {
+                                    "image_id": image_id,
+                                    "raw": gen_output.text,
+                                    "parse_error": parse_result.error,
+                                }
+                                stats["failed"] += 1
+
+                        with open(caption_path, "w", encoding="utf-8") as f:
+                            json.dump(data, f, indent=2, ensure_ascii=False)
+            else:
+                # All items in batch had errors
+                for image_id, error in zip(batch_ids, batch_errors):
+                    caption_path = input_dir / f"{image_id}.caption.json"
+                    data = {"image_id": image_id, "error": error or "Unknown error"}
+                    with open(caption_path, "w", encoding="utf-8") as f:
+                        json.dump(data, f, indent=2, ensure_ascii=False)
                     stats["failed"] += 1
-                else:
-                    data["caption"] = result.caption
-                    stats["success"] += 1
 
-                with open(caption_path, "w", encoding="utf-8") as f:
-                    json.dump(data, f, indent=2, ensure_ascii=False)
-
-                completed += 1
-                speed.tick()
-                pbar.update(1)
-                update_pbar()
-
-            except queue.Empty:
-                pass
+            speed.tick(len(batch_items))
+            pbar.update(len(batch_items))
+            update_pbar()
 
     except KeyboardInterrupt:
-        logger.info("\nInterrupted!")
+        logger.info(f"\n[GPU {gpu_id}] Interrupted!")
         _interrupted = True
 
     finally:
-        # Send shutdown signals
-        for _ in workers:
-            try:
-                task_queue.put(None, timeout=1.0)
-            except queue.Full:
-                pass
-
-        # Wait for workers
-        for p in workers:
-            p.join(timeout=5.0)
-            if p.is_alive():
-                p.terminate()
-
         pbar.close()
+        model.unload()
 
     return stats
 
@@ -500,45 +456,35 @@ def process_tensor_parallel(
     input_dir: Path,
     tensor_parallel_size: int,
     model_name: str,
-    backend: str,
     base_prompt: str,
+    output_format,
     with_tags: bool,
-    max_tokens: int,
-    temperature: float,
     batch_size: int,
+    max_tokens: int,
+    max_model_len: int,
+    temperature: float,
 ) -> dict[str, int]:
     """
     Process with tensor parallelism (single model across GPUs).
+    Uses batch inference for efficiency.
     """
     global _interrupted
+    from kohakucaption.local.vllm import VLLMModel, VLLMConfig
 
     stats = {"success": 0, "failed": 0}
     speed = SpeedMonitor()
     total = len(image_items)
 
-    # Load model
-    if backend == "vllm":
-        from kohakucaption.local.vllm import VLLMModel, VLLMConfig
-
-        config = VLLMConfig(
-            model=model_name,
-            tensor_parallel_size=tensor_parallel_size,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            gpu_memory_utilization=0.85,
-        )
-        model = VLLMModel(config)
-    else:
-        from kohakucaption.local.lmdeploy import LMDeployModel, LMDeployConfig
-
-        config = LMDeployConfig(
-            model=model_name,
-            tensor_parallel_size=tensor_parallel_size,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            backend="turbomind",
-        )
-        model = LMDeployModel(config)
+    # Load model with tensor parallelism
+    config = VLLMConfig(
+        model=model_name,
+        tensor_parallel_size=tensor_parallel_size,
+        max_tokens=max_tokens,
+        max_model_len=max_model_len,
+        temperature=temperature,
+        gpu_memory_utilization=0.9,
+    )
+    model = VLLMModel(config)
 
     logger.info(f"Loading model with tensor_parallel_size={tensor_parallel_size}")
     model.load()
@@ -565,6 +511,7 @@ def process_tensor_parallel(
             batch_images = []
             batch_prompts = []
             batch_ids = []
+            batch_errors = []
 
             for image_id, image_path, tag_path in batch_items:
                 try:
@@ -573,61 +520,106 @@ def process_tensor_parallel(
                     batch_images.append(image_rgb)
                     batch_ids.append(image_id)
 
-                    # Build prompt
                     if with_tags and tag_path.exists():
                         try:
                             with open(tag_path, "r", encoding="utf-8") as f:
                                 tag_data = json.load(f)
-                                tags = tag_data.get("tags")
-                                if tags:
-                                    tags_str = format_tags_for_prompt(tags)
-                                    batch_prompts.append(PROMPT_WITH_TAGS.format(tags=tags_str))
-                                else:
-                                    batch_prompts.append(base_prompt)
+                            prompt = build_prompt_with_tags(base_prompt, tag_data)
                         except Exception:
-                            batch_prompts.append(base_prompt)
+                            prompt = base_prompt
                     else:
-                        batch_prompts.append(base_prompt)
+                        prompt = base_prompt
+
+                    batch_prompts.append(prompt)
+                    batch_errors.append(None)
 
                 except Exception as e:
-                    # Write error
-                    caption_path = input_dir / f"{image_id}.caption.json"
-                    with open(caption_path, "w", encoding="utf-8") as f:
-                        json.dump({
+                    batch_errors.append(str(e))
+                    batch_ids.append(image_id)
+
+            # Filter valid items
+            valid_indices = [i for i, e in enumerate(batch_errors) if e is None]
+
+            if valid_indices:
+                valid_images = [batch_images[i] for i in range(len(batch_images))]
+                valid_prompts = [batch_prompts[i] for i in range(len(batch_prompts))]
+
+                # Batch inference with error handling
+                try:
+                    batch_output = model.generate_batch(valid_images, valid_prompts)
+                    batch_success = True
+                except Exception as e:
+                    error_msg = str(e)
+                    is_cuda_error = "CUDA" in error_msg or "cuda" in error_msg
+
+                    if is_cuda_error:
+                        logger.error(
+                            f"CUDA error during batch inference: {error_msg[:200]}"
+                        )
+                        logger.error(
+                            f"Marking {len(valid_images)} items as failed. "
+                            f"Restart with --skip-existing to continue."
+                        )
+                    else:
+                        logger.error(f"Batch inference error: {error_msg[:200]}")
+
+                    # Mark all items in this batch as failed
+                    for image_id in batch_ids:
+                        caption_path = input_dir / f"{image_id}.caption.json"
+                        data = {
                             "image_id": image_id,
-                            "error": str(e),
-                        }, f, indent=2, ensure_ascii=False)
-                    stats["failed"] += 1
-                    pbar.update(1)
+                            "error": f"Batch inference failed: {error_msg[:500]}",
+                        }
+                        with open(caption_path, "w", encoding="utf-8") as f:
+                            json.dump(data, f, indent=2, ensure_ascii=False)
+                        stats["failed"] += 1
 
-            if not batch_images:
-                continue
+                    batch_success = False
 
-            # Batch inference
-            try:
-                batch_output = model.generate_batch(
-                    images=batch_images,
-                    prompts=batch_prompts,
-                )
+                    # For CUDA errors, stop as GPU state may be corrupted
+                    if is_cuda_error:
+                        logger.error(
+                            "Stopping due to CUDA error. "
+                            "Restart with --skip-existing to resume."
+                        )
+                        _interrupted = True
+                        break
 
-                for image_id, output in zip(batch_ids, batch_output.outputs):
+                if batch_success:
+                    valid_idx = 0
+                    for i, (image_id, error) in enumerate(zip(batch_ids, batch_errors)):
+                        caption_path = input_dir / f"{image_id}.caption.json"
+
+                        if error:
+                            data = {"image_id": image_id, "error": error}
+                            stats["failed"] += 1
+                        else:
+                            gen_output = batch_output.outputs[valid_idx]
+                            valid_idx += 1
+
+                            parse_result = output_format.parse(gen_output.text)
+                            if parse_result.success:
+                                data = {
+                                    "image_id": image_id,
+                                    "caption": parse_result.data,
+                                }
+                                stats["success"] += 1
+                            else:
+                                data = {
+                                    "image_id": image_id,
+                                    "raw": gen_output.text,
+                                    "parse_error": parse_result.error,
+                                }
+                                stats["failed"] += 1
+
+                        with open(caption_path, "w", encoding="utf-8") as f:
+                            json.dump(data, f, indent=2, ensure_ascii=False)
+            else:
+                for image_id, error in zip(batch_ids, batch_errors):
                     caption_path = input_dir / f"{image_id}.caption.json"
-                    data = {
-                        "image_id": image_id,
-                        "caption": output.text,
-                    }
+                    data = {"image_id": image_id, "error": error or "Unknown error"}
                     with open(caption_path, "w", encoding="utf-8") as f:
                         json.dump(data, f, indent=2, ensure_ascii=False)
-                    stats["success"] += 1
-
-            except Exception as e:
-                for image_id in batch_ids:
-                    caption_path = input_dir / f"{image_id}.caption.json"
-                    with open(caption_path, "w", encoding="utf-8") as f:
-                        json.dump({
-                            "image_id": image_id,
-                            "error": str(e),
-                        }, f, indent=2, ensure_ascii=False)
                     stats["failed"] += 1
 
             speed.tick(len(batch_items))
@@ -647,108 +639,120 @@ def process_tensor_parallel(
 
 @click.command()
 @click.option(
-    "--input-dir", "-i",
+    "--input-dir",
+    "-i",
     type=click.Path(exists=True, file_okay=False, path_type=Path),
     required=True,
-    help="Input directory containing images and tag.json files"
+    help="Input directory containing images and tag.json files",
 )
 @click.option(
-    "--backend",
-    type=click.Choice(["vllm", "lmdeploy"]),
-    default="vllm",
-    show_default=True,
-    help="Inference backend"
-)
-@click.option(
-    "--model", "-m",
+    "--model",
+    "-m",
     type=str,
     default=None,
-    help="Model name/path (default: backend-specific)"
+    help=(
+        "Model name/path. Default: google/gemma-3-4b-it. "
+        "Gemma3 models: gemma-3-4b-it, gemma-3-12b-it, gemma-3-27b-it. "
+        "Gemma3n models: gemma-3n-E2B-it (2B active), gemma-3n-E4B-it (4B active)."
+    ),
 )
 @click.option(
     "--gpus",
     type=str,
-    default=None,
-    help="Comma-separated GPU IDs for data parallelism (e.g., '0,1,2,3')"
+    default="0",
+    show_default=True,
+    help="Comma-separated GPU IDs (e.g., '0,3,4,5')",
 )
 @click.option(
-    "--tensor-parallel", "-tp",
+    "--tensor-parallel",
+    "-tp",
     type=int,
     default=None,
-    help="Tensor parallel size. Mutually exclusive with --gpus."
+    help="Tensor parallel size (use instead of --gpus for large models)",
 )
 @click.option(
     "--with-tags/--no-tags",
     default=False,
     show_default=True,
-    help="Include tags as context in the caption prompt"
+    help="Include tags as context in the caption prompt",
 )
 @click.option(
-    "--batch-size", "-b",
+    "--batch-size",
+    "-b",
     type=int,
     default=8,
     show_default=True,
-    help="Batch size for tensor parallel mode"
+    help="Batch size for inference",
 )
 @click.option(
     "--max-tokens",
     type=int,
-    default=512,
+    default=2048,
     show_default=True,
-    help="Maximum tokens to generate"
+    help="Maximum tokens to generate",
+)
+@click.option(
+    "--max-model-len",
+    type=int,
+    default=8192,
+    show_default=True,
+    help="Maximum model context length (default 8k, Gemma3 supports up to 128k)",
 )
 @click.option(
     "--temperature",
     type=float,
     default=0.7,
     show_default=True,
-    help="Sampling temperature"
+    help="Sampling temperature",
 )
 @click.option(
-    "--max-samples", "-n",
+    "--max-samples",
+    "-n",
     type=int,
     default=None,
-    help="Maximum number of samples to process"
+    help="Maximum number of samples to process",
 )
 @click.option(
     "--skip-existing/--no-skip-existing",
     default=True,
     show_default=True,
-    help="Skip already processed samples"
+    help="Skip already processed samples",
 )
 @click.option(
-    "--prefetch",
+    "--worker-rank",
     type=int,
-    default=4,
-    show_default=True,
-    help="Number of images to prefetch per GPU (data parallel mode)"
+    default=None,
+    hidden=True,
+    help="Internal: worker rank for multi-GPU",
 )
 @click.option(
-    "--prompt",
-    type=str,
+    "--worker-world-size",
+    type=int,
     default=None,
-    help="Custom caption prompt (overrides default)"
+    hidden=True,
+    help="Internal: world size for multi-GPU",
 )
 def main(
     input_dir: Path,
-    backend: str,
     model: str | None,
-    gpus: str | None,
+    gpus: str,
     tensor_parallel: int | None,
     with_tags: bool,
     batch_size: int,
     max_tokens: int,
+    max_model_len: int,
     temperature: float,
     max_samples: int | None,
     skip_existing: bool,
-    prefetch: int,
-    prompt: str | None,
+    worker_rank: int | None,
+    worker_world_size: int | None,
 ):
     """
-    Caption images from a tagged folder.
+    Caption images from a tagged folder using vLLM.
 
-    Reads images and tag.json files from input directory (output of imagenet_tagging.py)
-    and generates caption.json files.
+    Uses the DefaultFormat system to generate structured captions with:
+    - aesthetic_score, nsfw_score, quality_score
+    - title, brief, description
 
     \b
     Input structure:
@@ -756,7 +760,7 @@ def main(
         <id>.tag.json   - Tags (from tagging script)
 
     Output:
-        <id>.caption.json - Generated caption
+        <id>.caption.json - Generated caption with structured fields
 
     \b
     Parallelism modes:
@@ -765,42 +769,188 @@ def main(
 
     \b
     Examples:
-        # Data parallel on 4 GPUs
-        python scripts/imagenet_captioning.py -i ./imagenet_data --gpus 0,1,2,3
+        # Single GPU
+        python scripts/imagenet_captioning.py -i ./imagenet_data --gpus 0
+
+        # Multi-GPU (data parallel)
+        python scripts/imagenet_captioning.py -i ./imagenet_data --gpus 0,3,4,5
 
         # With tags as context
-        python scripts/imagenet_captioning.py -i ./imagenet_data --gpus 0,1,2,3 --with-tags
+        python scripts/imagenet_captioning.py -i ./imagenet_data --gpus 0,3,4,5 --with-tags
 
-        # Tensor parallel with LMDeploy
-        python scripts/imagenet_captioning.py -i ./imagenet_data -tp 4 --backend lmdeploy
+        # Tensor parallel (for large models like gemma-3-27b-it)
+        python scripts/imagenet_captioning.py -i ./imagenet_data --tensor-parallel 4 -m google/gemma-3-27b-it
     """
+    from kohakucaption.formats import DefaultFormat
+
     signal.signal(signal.SIGINT, _signal_handler)
     if sys.platform != "win32":
         signal.signal(signal.SIGTERM, _signal_handler)
 
-    # Validate options
-    if gpus and tensor_parallel:
-        raise click.ClickException("Cannot use both --gpus and --tensor-parallel.")
-
-    if not gpus and not tensor_parallel:
-        gpus = "0"
-        logger.info("No GPU option specified, defaulting to GPU 0")
-
-    # Parse GPU IDs
-    gpu_ids = None
-    if gpus:
-        gpu_ids = [int(x.strip()) for x in gpus.split(",")]
-
     # Use default model if not specified
     if model is None:
-        model = DEFAULT_MODELS[backend]
+        model = DEFAULT_MODEL
 
-    # Use custom or default prompt
-    base_prompt = prompt if prompt else DEFAULT_PROMPT
+    # Create output format and base prompt
+    output_format = DefaultFormat()
+    base_prompt = f"""Provide a structured caption for this image.
 
+{output_format.get_format_instruction()}"""
+
+    # Parse GPU IDs
+    gpu_ids = [g.strip() for g in gpus.split(",")]
+
+    # Check if this is a worker subprocess or main process
+    is_worker = worker_rank is not None and worker_world_size is not None
+
+    if is_worker:
+        # Worker subprocess: process our shard
+        image_items = find_images(input_dir)
+
+        if max_samples is not None:
+            image_items = image_items[:max_samples]
+
+        if skip_existing:
+            image_items = [
+                item
+                for item in image_items
+                if not (input_dir / f"{item[0]}.caption.json").exists()
+            ]
+
+        if not image_items:
+            return
+
+        process_batch(
+            image_items=image_items,
+            input_dir=input_dir,
+            model_name=model,
+            base_prompt=base_prompt,
+            output_format=output_format,
+            with_tags=with_tags,
+            batch_size=batch_size,
+            max_tokens=max_tokens,
+            max_model_len=max_model_len,
+            temperature=temperature,
+            rank=worker_rank,
+            world_size=worker_world_size,
+        )
+
+    elif tensor_parallel:
+        # Tensor parallel mode
+        _run_tensor_parallel(
+            input_dir=input_dir,
+            model=model,
+            tensor_parallel=tensor_parallel,
+            base_prompt=base_prompt,
+            output_format=output_format,
+            with_tags=with_tags,
+            batch_size=batch_size,
+            max_tokens=max_tokens,
+            max_model_len=max_model_len,
+            temperature=temperature,
+            max_samples=max_samples,
+            skip_existing=skip_existing,
+        )
+
+    elif len(gpu_ids) > 1:
+        # Multi-GPU data parallel: spawn subprocesses
+        _run_multi_gpu(
+            input_dir=input_dir,
+            model=model,
+            gpu_ids=gpu_ids,
+            with_tags=with_tags,
+            batch_size=batch_size,
+            max_tokens=max_tokens,
+            max_model_len=max_model_len,
+            temperature=temperature,
+            max_samples=max_samples,
+            skip_existing=skip_existing,
+        )
+
+    else:
+        # Single GPU
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids[0]
+
+        image_items = find_images(input_dir)
+
+        if not image_items:
+            click.echo("No images found! Make sure to run imagenet_tagging.py first.")
+            return
+
+        if max_samples is not None:
+            image_items = image_items[:max_samples]
+
+        if skip_existing:
+            original = len(image_items)
+            image_items = [
+                item
+                for item in image_items
+                if not (input_dir / f"{item[0]}.caption.json").exists()
+            ]
+            skipped = original - len(image_items)
+            if skipped > 0:
+                logger.info(f"Skipping {skipped} already processed samples")
+
+        if not image_items:
+            click.echo("All samples already processed!")
+            return
+
+        # Print config
+        click.echo("=" * 60)
+        click.echo("ImageNet-1k Captioning")
+        click.echo("=" * 60)
+        click.echo(f"Input: {input_dir} | Samples: {len(image_items)}")
+        click.echo(f"Model: {model}")
+        click.echo(f"Mode: Single GPU | Batch size: {batch_size}")
+        click.echo(f"With tags: {with_tags} | Max tokens: {max_tokens}")
+        click.echo("=" * 60)
+
+        start_time = time.time()
+
+        stats = process_batch(
+            image_items=image_items,
+            input_dir=input_dir,
+            model_name=model,
+            base_prompt=base_prompt,
+            output_format=output_format,
+            with_tags=with_tags,
+            batch_size=batch_size,
+            max_tokens=max_tokens,
+            max_model_len=max_model_len,
+            temperature=temperature,
+            rank=0,
+            world_size=1,
+        )
+
+        elapsed = time.time() - start_time
+        total_processed = stats["success"] + stats["failed"]
+
+        click.echo()
+        click.echo("=" * 60)
+        click.echo(f"Completed in {elapsed:.1f}s")
+        click.echo(f"Success: {stats['success']} | Failed: {stats['failed']}")
+        if total_processed > 0:
+            click.echo(f"Speed: {total_processed / elapsed:.2f} img/s")
+        click.echo("=" * 60)
+
+
+def _run_multi_gpu(
+    input_dir: Path,
+    model: str,
+    gpu_ids: list[str],
+    with_tags: bool,
+    batch_size: int,
+    max_tokens: int,
+    max_model_len: int,
+    temperature: float,
+    max_samples: int | None,
+    skip_existing: bool,
+):
+    """Main process: spawn worker subprocesses for each GPU."""
     start_time = time.time()
+    world_size = len(gpu_ids)
 
-    # Find images
+    # Find and filter images first (so all workers see same list)
     logger.info(f"Scanning {input_dir} for images...")
     image_items = find_images(input_dir)
     logger.info(f"Found {len(image_items)} images with tags")
@@ -809,15 +959,14 @@ def main(
         click.echo("No images found! Make sure to run imagenet_tagging.py first.")
         return
 
-    # Limit samples
     if max_samples is not None:
         image_items = image_items[:max_samples]
 
-    # Filter existing
     if skip_existing:
         original = len(image_items)
         image_items = [
-            item for item in image_items
+            item
+            for item in image_items
             if not (input_dir / f"{item[0]}.caption.json").exists()
         ]
         skipped = original - len(image_items)
@@ -833,41 +982,119 @@ def main(
     click.echo("ImageNet-1k Captioning")
     click.echo("=" * 60)
     click.echo(f"Input: {input_dir} | Samples: {len(image_items)}")
-    click.echo(f"Backend: {backend} | Model: {model}")
-    if gpu_ids:
-        click.echo(f"Mode: Data Parallel | GPUs: {gpu_ids}")
-    else:
-        click.echo(f"Mode: Tensor Parallel | TP Size: {tensor_parallel}")
+    click.echo(f"Model: {model}")
+    click.echo(f"Mode: Data Parallel | GPUs: {gpu_ids} | Batch size: {batch_size}")
+    click.echo(f"With tags: {with_tags} | Max tokens: {max_tokens}")
+    click.echo("=" * 60)
+
+    # Spawn worker subprocesses
+    processes = []
+    for rank, gpu_id in enumerate(gpu_ids):
+        p = run_worker_subprocess(
+            gpu_id=gpu_id,
+            rank=rank,
+            world_size=world_size,
+            input_dir=input_dir,
+            model=model,
+            with_tags=with_tags,
+            batch_size=batch_size,
+            max_tokens=max_tokens,
+            max_model_len=max_model_len,
+            temperature=temperature,
+            max_samples=max_samples,
+            skip_existing=skip_existing,
+        )
+        processes.append(p)
+        logger.info(f"Spawned worker on GPU {gpu_id} (rank {rank}/{world_size})")
+
+    # Wait for all workers
+    try:
+        for p in processes:
+            p.wait()
+    except KeyboardInterrupt:
+        logger.info("\nInterrupted! Terminating workers...")
+        for p in processes:
+            p.terminate()
+        for p in processes:
+            p.wait()
+
+    elapsed = time.time() - start_time
+    click.echo()
+    click.echo("=" * 60)
+    click.echo(f"Completed in {elapsed:.1f}s")
+    click.echo("=" * 60)
+
+
+def _run_tensor_parallel(
+    input_dir: Path,
+    model: str,
+    tensor_parallel: int,
+    base_prompt: str,
+    output_format,
+    with_tags: bool,
+    batch_size: int,
+    max_tokens: int,
+    max_model_len: int,
+    temperature: float,
+    max_samples: int | None,
+    skip_existing: bool,
+):
+    """Tensor parallel mode: single model across GPUs."""
+    start_time = time.time()
+
+    # Find images
+    logger.info(f"Scanning {input_dir} for images...")
+    image_items = find_images(input_dir)
+    logger.info(f"Found {len(image_items)} images with tags")
+
+    if not image_items:
+        click.echo("No images found! Make sure to run imagenet_tagging.py first.")
+        return
+
+    if max_samples is not None:
+        image_items = image_items[:max_samples]
+
+    if skip_existing:
+        original = len(image_items)
+        image_items = [
+            item
+            for item in image_items
+            if not (input_dir / f"{item[0]}.caption.json").exists()
+        ]
+        skipped = original - len(image_items)
+        if skipped > 0:
+            logger.info(f"Skipping {skipped} already processed samples")
+
+    if not image_items:
+        click.echo("All samples already processed!")
+        return
+
+    # Print config
+    click.echo("=" * 60)
+    click.echo("ImageNet-1k Captioning")
+    click.echo("=" * 60)
+    click.echo(f"Input: {input_dir} | Samples: {len(image_items)}")
+    click.echo(f"Model: {model}")
+    click.echo(
+        f"Mode: Tensor Parallel | TP Size: {tensor_parallel} | Batch size: {batch_size}"
+    )
     click.echo(f"With tags: {with_tags} | Max tokens: {max_tokens}")
     click.echo("=" * 60)
 
     # Process
-    if gpu_ids:
-        stats = process_data_parallel(
-            image_items=image_items,
-            input_dir=input_dir,
-            gpu_ids=gpu_ids,
-            model_name=model,
-            backend=backend,
-            base_prompt=base_prompt,
-            with_tags=with_tags,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            prefetch=prefetch,
-        )
-    else:
-        stats = process_tensor_parallel(
-            image_items=image_items,
-            input_dir=input_dir,
-            tensor_parallel_size=tensor_parallel,
-            model_name=model,
-            backend=backend,
-            base_prompt=base_prompt,
-            with_tags=with_tags,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            batch_size=batch_size,
-        )
+    stats = process_tensor_parallel(
+        image_items=image_items,
+        input_dir=input_dir,
+        tensor_parallel_size=tensor_parallel,
+        model_name=model,
+        base_prompt=base_prompt,
+        output_format=output_format,
+        with_tags=with_tags,
+        batch_size=batch_size,
+        max_tokens=max_tokens,
+        max_model_len=max_model_len,
+        temperature=temperature,
+    )
 
     elapsed = time.time() - start_time
     total_processed = stats["success"] + stats["failed"]
@@ -882,5 +1109,4 @@ def main(
 
 
 if __name__ == "__main__":
-    mp.set_start_method("spawn", force=True)
     main()

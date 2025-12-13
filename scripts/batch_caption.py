@@ -44,6 +44,7 @@ def _signal_handler(signum, frame):
     _interrupted = True
     raise KeyboardInterrupt
 
+
 # Add src to path for local development
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
@@ -76,15 +77,19 @@ DEFAULT_TAGGER_REPO = "animetimm/caformer_b36.dbv4-full"
 @dataclass
 class CaptionTask:
     """Task for the caption worker."""
+
     path: Path
     base64_image: str
     tags: dict[str, Any] | None = None  # Tags to send to LLM (None = don't send)
-    tags_for_save: dict[str, Any] | None = None  # Tags to save in output (always save if available)
+    tags_for_save: dict[str, Any] | None = (
+        None  # Tags to save in output (always save if available)
+    )
 
 
 @dataclass
 class CaptionResult:
     """Result from caption worker."""
+
     path: Path
     tags_for_save: dict[str, Any] | None  # Tags to save in output
     caption: dict[str, Any] | None
@@ -325,7 +330,9 @@ class CaptionWorker:
                 # task.tags is for LLM context (may be None in parallel mode)
                 # task.tags_for_save is always saved to output
                 final_prompt = build_prompt_with_tags(self.base_prompt, task.tags)
-                image = ImageInput(source="", base64_data=task.base64_image, mime_type="image/jpeg")
+                image = ImageInput(
+                    source="", base64_data=task.base64_image, mime_type="image/jpeg"
+                )
                 result = await self.client.caption(image=image, prompt=final_prompt)
 
                 if result.success:
@@ -490,7 +497,7 @@ def process_batch_caption(
       - Main thread does sequential GPU work (no threading issues)
       - Async worker handles network I/O
     """
-    send_tags_to_llm = (mode == "context")
+    send_tags_to_llm = mode == "context"
     stats = {"success": 0, "failed": 0}
     speed = SpeedMonitor()
     total = len(image_paths)
@@ -501,6 +508,7 @@ def process_batch_caption(
     tagger_transform = None
     if with_tags:
         from kohakucaption.tagger import AnimeTimmTagger
+
         tagger = AnimeTimmTagger(repo_id=tagger_repo, use_fp16=True)
         tagger._load_model()
         tagger_transform = tagger._transform
@@ -570,7 +578,9 @@ def process_batch_caption(
                 if error:
                     # Write error result directly
                     data = {"image": path.name, "error": error}
-                    with open(output_dir / f"{path.stem}.json", "w", encoding="utf-8") as f:
+                    with open(
+                        output_dir / f"{path.stem}.json", "w", encoding="utf-8"
+                    ) as f:
                         json.dump(data, f, indent=2, ensure_ascii=False)
                     stats["failed"] += 1
                     speed.tick()
@@ -610,7 +620,9 @@ def process_batch_caption(
                 data["caption_error"] = result.error
                 stats["failed"] += 1
 
-            with open(output_dir / f"{result.path.stem}.json", "w", encoding="utf-8") as f:
+            with open(
+                output_dir / f"{result.path.stem}.json", "w", encoding="utf-8"
+            ) as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
 
             speed.tick()
@@ -637,28 +649,51 @@ def process_batch_caption(
             tagger.unload()
 
     if interrupted:
-        click.echo(f"\nInterrupted. Completed: {stats['success']} OK, {stats['failed']} failed")
+        click.echo(
+            f"\nInterrupted. Completed: {stats['success']} OK, {stats['failed']} failed"
+        )
         raise KeyboardInterrupt
 
     return stats
 
 
 @click.command()
-@click.argument("input_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
-@click.option("--output-dir", "-o", type=click.Path(file_okay=False, path_type=Path), default=None)
-@click.option("--provider", "-p", type=click.Choice(["openai", "openrouter"]), default="openai")
+@click.argument(
+    "input_dir", type=click.Path(exists=True, file_okay=False, path_type=Path)
+)
+@click.option(
+    "--output-dir", "-o", type=click.Path(file_okay=False, path_type=Path), default=None
+)
+@click.option(
+    "--provider", "-p", type=click.Choice(["openai", "openrouter"]), default="openai"
+)
 @click.option("--model", "-m", type=str, default=None)
-@click.option("--api-key", type=str, default=None, envvar=["OPENAI_API_KEY", "OPENROUTER_API_KEY"])
+@click.option(
+    "--api-key", type=str, default=None, envvar=["OPENAI_API_KEY", "OPENROUTER_API_KEY"]
+)
 @click.option("--max-concurrent", "-c", type=int, default=5, show_default=True)
-@click.option("--with-tags/--no-tags", default=False, help="Enable tagger to generate tags")
-@click.option("--mode", type=click.Choice(["parallel", "context"]), default="context",
-              help="parallel: tags saved but NOT sent to LLM; context: tags sent to LLM as context")
+@click.option(
+    "--with-tags/--no-tags", default=False, help="Enable tagger to generate tags"
+)
+@click.option(
+    "--mode",
+    type=click.Choice(["parallel", "context"]),
+    default="context",
+    help="parallel: tags saved but NOT sent to LLM; context: tags sent to LLM as context",
+)
 @click.option("--tagger-repo", type=str, default=DEFAULT_TAGGER_REPO, show_default=True)
 @click.option("--tagger-batch-size", type=int, default=8, show_default=True)
 @click.option("--num-workers", "-w", type=int, default=4, show_default=True)
-@click.option("--detail", type=click.Choice(["low", "high", "auto"]), default="auto", show_default=True)
+@click.option(
+    "--detail",
+    type=click.Choice(["low", "high", "auto"]),
+    default="auto",
+    show_default=True,
+)
 @click.option("--timeout", type=float, default=120.0, show_default=True)
-@click.option("--extensions", type=str, default=".jpg,.jpeg,.png,.webp,.gif", show_default=True)
+@click.option(
+    "--extensions", type=str, default=".jpg,.jpeg,.png,.webp,.gif", show_default=True
+)
 @click.option("--skip-existing/--no-skip-existing", default=False)
 def main(
     input_dir: Path,
@@ -707,7 +742,9 @@ def main(
 
     if skip_existing:
         orig = len(image_paths)
-        image_paths = [p for p in image_paths if not (output_dir / f"{p.stem}.json").exists()]
+        image_paths = [
+            p for p in image_paths if not (output_dir / f"{p.stem}.json").exists()
+        ]
         if orig - len(image_paths) > 0:
             logger.info(f"Skipped {orig - len(image_paths)} existing")
         if not image_paths:
@@ -715,8 +752,12 @@ def main(
             return
 
     click.echo("=" * 60)
-    click.echo(f"Images: {len(image_paths)} | Provider: {provider} | Model: {model or get_default_model(provider)}")
-    click.echo(f"Concurrent: {max_concurrent} | Tags: {with_tags} | Mode: {mode if with_tags else 'N/A'} | Workers: {num_workers}")
+    click.echo(
+        f"Images: {len(image_paths)} | Provider: {provider} | Model: {model or get_default_model(provider)}"
+    )
+    click.echo(
+        f"Concurrent: {max_concurrent} | Tags: {with_tags} | Mode: {mode if with_tags else 'N/A'} | Workers: {num_workers}"
+    )
     if with_tags:
         click.echo(f"Tagger: {tagger_repo} | Batch: {tagger_batch_size}")
     click.echo("=" * 60)
@@ -727,7 +768,9 @@ def main(
         timeout=timeout,
         detail=detail,
     )
-    client = OpenRouterClient(config) if provider == "openrouter" else OpenAIClient(config)
+    client = (
+        OpenRouterClient(config) if provider == "openrouter" else OpenAIClient(config)
+    )
 
     output_format = DefaultFormat()
     prompt = f"""Provide a structured caption for this image.
@@ -751,7 +794,9 @@ def main(
         elapsed = time.time() - start
         click.echo()
         click.echo("=" * 60)
-        click.echo(f"Done: {stats['success']} OK, {stats['failed']} failed | {elapsed:.1f}s | {len(image_paths)/elapsed:.2f} img/s")
+        click.echo(
+            f"Done: {stats['success']} OK, {stats['failed']} failed | {elapsed:.1f}s | {len(image_paths)/elapsed:.2f} img/s"
+        )
         click.echo("=" * 60)
     except KeyboardInterrupt:
         elapsed = time.time() - start
