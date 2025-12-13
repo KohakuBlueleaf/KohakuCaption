@@ -45,7 +45,9 @@ def count_tokens(text: str, tokenizer_name: str = DEFAULT_TOKENIZER) -> int:
     return len(tokenizer.encode(text, add_special_tokens=False))
 
 
-def count_tokens_batch(texts: list[str], tokenizer_name: str = DEFAULT_TOKENIZER) -> list[int]:
+def count_tokens_batch(
+    texts: list[str], tokenizer_name: str = DEFAULT_TOKENIZER
+) -> list[int]:
     """
     Count tokens for multiple texts efficiently.
 

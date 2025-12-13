@@ -36,17 +36,13 @@ dev = [
 jsonschema = [
     "jsonschema>=4.0",
 ]
-# Local inference backends (install separately due to CUDA requirements)
+# Local inference backend (install separately due to CUDA requirements)
 vllm = [
     "vllm>=0.6.0",
 ]
-lmdeploy = [
-    "lmdeploy>=0.6.0",
-]
-# All local inference backends
+# Alias for backwards compatibility
 local = [
     "vllm>=0.6.0",
-    "lmdeploy>=0.6.0",
 ]
 
 [tool.setuptools]

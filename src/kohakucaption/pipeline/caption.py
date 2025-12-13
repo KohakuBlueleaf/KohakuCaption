@@ -255,7 +255,7 @@ class CaptionPipeline:
         return CaptionResult(
             success=False,
             error=f"Validation failed after {validation_attempts} attempts: "
-                  f"{last_validation.error if last_validation else 'Unknown error'}",
+            f"{last_validation.error if last_validation else 'Unknown error'}",
             raw_response=last_result.raw_response if last_result else None,
             retries_used=total_retries,
             latency_ms=last_result.latency_ms if last_result else 0,

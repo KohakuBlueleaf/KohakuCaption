@@ -156,6 +156,7 @@ class JsonSchemaValidator(OutputValidator[dict[str, Any]]):
         if self._validator is None:
             try:
                 import jsonschema
+
                 self._validator = jsonschema.Draft7Validator(self.schema)
             except ImportError:
                 raise ImportError(
@@ -359,7 +360,8 @@ class CompositeValidator(OutputValidator[T]):
         if self.mode == "first_success":
             return ValidationResult(
                 valid=False,
-                error="All validators failed:\n" + "\n".join(f"- {e}" for e in errors if e),
+                error="All validators failed:\n"
+                + "\n".join(f"- {e}" for e in errors if e),
                 raw_input=output,
             )
 

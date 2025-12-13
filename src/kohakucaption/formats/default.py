@@ -11,7 +11,9 @@ from kohakucaption.formats.base import FormatField, OutputFormat, ParseResult
 # Default fields for caption
 DEFAULT_CAPTION_FIELDS = [
     FormatField("aesthetic_score", "Aesthetic quality score 0.0-1.0", "float"),
-    FormatField("nsfw_score", "NSFW content score 0.0-1.0 (0=safe, 1=explicit)", "float"),
+    FormatField(
+        "nsfw_score", "NSFW content score 0.0-1.0 (0=safe, 1=explicit)", "float"
+    ),
     FormatField("quality_score", "Technical quality score 0.0-1.0", "float"),
     FormatField("title", "Short descriptive title (5-10 words)", "str"),
     FormatField("brief", "One-sentence summary", "str"),
@@ -58,8 +60,12 @@ class DefaultFormat(OutputFormat):
         lines.append("- Each field starts with # followed by the field name")
         lines.append("- Value goes on the next line(s) until the next # or end")
         lines.append("- No extra formatting, no markdown, no JSON")
-        lines.append("- Write in direct declarative sentences, never use 'this image shows' or similar")
-        lines.append("- Cover ALL visual elements: subjects, actions, background, lighting, colors, style")
+        lines.append(
+            "- Write in direct declarative sentences, never use 'this image shows' or similar"
+        )
+        lines.append(
+            "- Cover ALL visual elements: subjects, actions, background, lighting, colors, style"
+        )
         lines.append("- If nsfw_score > 0.3, describe explicit content in detail")
 
         return "\n".join(lines)

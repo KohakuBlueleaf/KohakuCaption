@@ -13,7 +13,12 @@ from kohakucaption.clients import MLLMClient, OpenAIClient, OpenRouterClient
 from kohakucaption.context import ContextProvider, TemplateEngine
 from kohakucaption.formats import DefaultFormat, JsonFormat, OutputFormat
 from kohakucaption.pipeline import CaptionPipeline
-from kohakucaption.tagger import AnimeTimmTagger, AnimeTimmTagResult, PixAITagger, TagResult
+from kohakucaption.tagger import (
+    AnimeTimmTagger,
+    AnimeTimmTagResult,
+    PixAITagger,
+    TagResult,
+)
 from kohakucaption.tokenizer import TokenCounter, count_caption_tokens, count_tokens
 from kohakucaption.types import CaptionRequest, CaptionResult, ContextType, ImageInput
 from kohakucaption.validation import (

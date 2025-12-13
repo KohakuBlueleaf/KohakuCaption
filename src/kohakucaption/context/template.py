@@ -58,7 +58,9 @@ class TemplateEngine:
         self._formatters["strip"] = lambda x: str(x).strip()
         self._formatters["json"] = self._format_json
         self._formatters["list"] = self._format_list
-        self._formatters["csv"] = lambda x: ", ".join(str(i) for i in x) if isinstance(x, (list, tuple)) else str(x)
+        self._formatters["csv"] = lambda x: (
+            ", ".join(str(i) for i in x) if isinstance(x, (list, tuple)) else str(x)
+        )
 
     @staticmethod
     def _format_json(value: Any) -> str:
@@ -188,7 +190,9 @@ class PromptTemplate:
     required_vars: list[str] = field(default_factory=list)
     optional_vars: list[str] = field(default_factory=list)
 
-    def render(self, context: dict[str, Any], engine: TemplateEngine | None = None) -> str:
+    def render(
+        self, context: dict[str, Any], engine: TemplateEngine | None = None
+    ) -> str:
         """Render this template with the given context."""
         if engine is None:
             engine = TemplateEngine()

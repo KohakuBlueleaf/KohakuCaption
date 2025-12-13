@@ -8,7 +8,12 @@ from typing import Any
 
 from openai import AsyncOpenAI, RateLimitError as OpenAIRateLimitError
 
-from kohakucaption.clients.base import ClientConfig, MLLMClient, RateLimitError, StatsLogger
+from kohakucaption.clients.base import (
+    ClientConfig,
+    MLLMClient,
+    RateLimitError,
+    StatsLogger,
+)
 
 logger = logging.getLogger(__name__)
 

@@ -60,7 +60,9 @@ class AnimeTimmTagResult:
             tags = ", ".join(tag.replace("_", " ") for tag in self.general_tags.keys())
             parts.append(f"Features: {tags}")
         if self.character_tags:
-            tags = ", ".join(tag.replace("_", " ") for tag in self.character_tags.keys())
+            tags = ", ".join(
+                tag.replace("_", " ") for tag in self.character_tags.keys()
+            )
             parts.append(f"Characters: {tags}")
         if self.rating_tags:
             rating = max(self.rating_tags.keys(), key=lambda k: self.rating_tags[k])
@@ -151,7 +153,9 @@ class AnimeTimmTagger:
 
     def _download_file(self, filename: str) -> str:
         """Download a file from the repo."""
-        return hf_hub_download(repo_id=self.repo_id, repo_type="model", filename=filename)
+        return hf_hub_download(
+            repo_id=self.repo_id, repo_type="model", filename=filename
+        )
 
     def _load_model(self) -> None:
         """Load model and metadata lazily."""
@@ -211,7 +215,9 @@ class AnimeTimmTagger:
             self._model = self._model.half()
 
         self._loaded = True
-        logger.info(f"AnimeTIMM Tagger loaded: {self.repo_id} on {self.device} (fp16={self.use_fp16})")
+        logger.info(
+            f"AnimeTIMM Tagger loaded: {self.repo_id} on {self.device} (fp16={self.use_fp16})"
+        )
 
     def _build_transform(self, config: list[dict]) -> T.Compose:
         """Build torchvision transforms from preprocess config."""
@@ -290,13 +296,17 @@ class AnimeTimmTagger:
         if len(general_indices) > 0:
             general_indices = general_indices[np.argsort(-probs_np[general_indices])]
         if len(character_indices) > 0:
-            character_indices = character_indices[np.argsort(-probs_np[character_indices])]
+            character_indices = character_indices[
+                np.argsort(-probs_np[character_indices])
+            ]
         if len(rating_indices) > 0:
             rating_indices = rating_indices[np.argsort(-probs_np[rating_indices])]
 
         # Build dicts from sorted indices (minimal Python loop over selected tags only)
         general_tags = {self._tag_names[i]: float(probs_np[i]) for i in general_indices}
-        character_tags = {self._tag_names[i]: float(probs_np[i]) for i in character_indices}
+        character_tags = {
+            self._tag_names[i]: float(probs_np[i]) for i in character_indices
+        }
         rating_tags = {self._tag_names[i]: float(probs_np[i]) for i in rating_indices}
 
         return AnimeTimmTagResult(
@@ -305,7 +315,9 @@ class AnimeTimmTagger:
             rating_tags=rating_tags,
         )
 
-    def _process_probs_batch(self, batch_probs: torch.Tensor) -> list[AnimeTimmTagResult]:
+    def _process_probs_batch(
+        self, batch_probs: torch.Tensor
+    ) -> list[AnimeTimmTagResult]:
         """Process batch of probability tensors (vectorized).
 
         Args:
@@ -348,21 +360,29 @@ class AnimeTimmTagger:
         results = []
         for b in range(batch_size):
             # Slice sorted indices up to count (already sorted by prob descending)
-            g_idx = general_sorted_idx[b, :general_counts[b]]
-            c_idx = character_sorted_idx[b, :character_counts[b]]
-            r_idx = rating_sorted_idx[b, :rating_counts[b]]
+            g_idx = general_sorted_idx[b, : general_counts[b]]
+            c_idx = character_sorted_idx[b, : character_counts[b]]
+            r_idx = rating_sorted_idx[b, : rating_counts[b]]
 
             # Build dicts using numpy advanced indexing
             probs_b = probs_np[b]
-            general_tags = dict(zip(self._tag_names[g_idx], probs_b[g_idx].astype(float)))
-            character_tags = dict(zip(self._tag_names[c_idx], probs_b[c_idx].astype(float)))
-            rating_tags = dict(zip(self._tag_names[r_idx], probs_b[r_idx].astype(float)))
+            general_tags = dict(
+                zip(self._tag_names[g_idx], probs_b[g_idx].astype(float))
+            )
+            character_tags = dict(
+                zip(self._tag_names[c_idx], probs_b[c_idx].astype(float))
+            )
+            rating_tags = dict(
+                zip(self._tag_names[r_idx], probs_b[r_idx].astype(float))
+            )
 
-            results.append(AnimeTimmTagResult(
-                general_tags=general_tags,
-                character_tags=character_tags,
-                rating_tags=rating_tags,
-            ))
+            results.append(
+                AnimeTimmTagResult(
+                    general_tags=general_tags,
+                    character_tags=character_tags,
+                    rating_tags=rating_tags,
+                )
+            )
 
         return results
 

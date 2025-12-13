@@ -149,7 +149,9 @@ class PixAITagger:
         model = nn.Sequential(encoder, decoder)
 
         # Load weights
-        state_dict = torch.load(weights_file, map_location=self.device, weights_only=True)
+        state_dict = torch.load(
+            weights_file, map_location=self.device, weights_only=True
+        )
         model.load_state_dict(state_dict)
         model.to(self.device)
         model.eval()
@@ -161,11 +163,13 @@ class PixAITagger:
         self._model = model
 
         # Transform
-        self._transform = T.Compose([
-            T.Resize((448, 448)),
-            T.ToTensor(),
-            T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        ])
+        self._transform = T.Compose(
+            [
+                T.Resize((448, 448)),
+                T.ToTensor(),
+                T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            ]
+        )
 
         self._loaded = True
         logger.info(f"PixAI Tagger loaded on {self.device} (fp16={self.use_fp16})")
@@ -201,7 +205,9 @@ class PixAITagger:
 
         # Get indices
         general_indices = general_mask.nonzero(as_tuple=True)[0]
-        character_indices = character_mask.nonzero(as_tuple=True)[0] + self._gen_tag_count
+        character_indices = (
+            character_mask.nonzero(as_tuple=True)[0] + self._gen_tag_count
+        )
 
         combined_indices = torch.cat((general_indices, character_indices)).cpu()
 
@@ -307,7 +313,10 @@ class PixAITagger:
 
             batch_tensor = batch_tensor.to(self.device)
 
-            with torch.no_grad(), torch.amp.autocast(self.device, enabled=self.use_fp16):
+            with (
+                torch.no_grad(),
+                torch.amp.autocast(self.device, enabled=self.use_fp16),
+            ):
                 batch_probs = self._model(batch_tensor)
 
             # Process each result

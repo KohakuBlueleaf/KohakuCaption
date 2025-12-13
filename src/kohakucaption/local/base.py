@@ -155,7 +155,9 @@ class LocalVLMBase(ABC):
         """
         pass
 
-    def _prepare_image(self, image: ImageInput | Image.Image | str | Path) -> Image.Image:
+    def _prepare_image(
+        self, image: ImageInput | Image.Image | str | Path
+    ) -> Image.Image:
         """Convert various image types to PIL Image."""
         if isinstance(image, Image.Image):
             return self._ensure_rgb(image)
@@ -298,20 +300,24 @@ class LocalVLMBase(ABC):
 
         try:
             pil_images = [self._prepare_image(img) for img in images]
-            batch_output = self.generate_batch(pil_images, prompts, system_prompt, **kwargs)
+            batch_output = self.generate_batch(
+                pil_images, prompts, system_prompt, **kwargs
+            )
 
             results = []
             per_image_latency = batch_output.total_time_ms / len(images)
 
             for output in batch_output.outputs:
-                results.append(CaptionResult(
-                    success=True,
-                    content=output.text,
-                    raw_response=output.text,
-                    retries_used=0,
-                    latency_ms=per_image_latency,
-                    model=self.config.model,
-                ))
+                results.append(
+                    CaptionResult(
+                        success=True,
+                        content=output.text,
+                        raw_response=output.text,
+                        retries_used=0,
+                        latency_ms=per_image_latency,
+                        model=self.config.model,
+                    )
+                )
 
             return results
 

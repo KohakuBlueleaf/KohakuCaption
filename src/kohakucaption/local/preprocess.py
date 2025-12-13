@@ -76,7 +76,7 @@ class ImageDataset(Dataset):
             "filename": path.name,
         }
         # EXIF data if available
-        if hasattr(image, '_getexif') and image._getexif():
+        if hasattr(image, "_getexif") and image._getexif():
             meta["exif"] = dict(image._getexif())
         return meta
 

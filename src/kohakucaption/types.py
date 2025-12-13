@@ -122,7 +122,9 @@ class BasicCaption(BaseModel):
     """Basic caption output schema with scoring."""
 
     aesthetic_score: float = Field(description="Aesthetic quality score 0.0-1.0")
-    nsfw_score: float = Field(description="NSFW content score 0.0-1.0 (0=safe, 1=explicit)")
+    nsfw_score: float = Field(
+        description="NSFW content score 0.0-1.0 (0=safe, 1=explicit)"
+    )
     quality_score: float = Field(description="Technical quality score 0.0-1.0")
     title: str = Field(description="A short, descriptive title for the image")
     brief: str = Field(description="A brief one-sentence description")
@@ -136,7 +138,9 @@ class DetailedCaption(BaseModel):
     """Extended caption output schema with more fields."""
 
     aesthetic_score: float = Field(description="Aesthetic quality score 0.0-1.0")
-    nsfw_score: float = Field(description="NSFW content score 0.0-1.0 (0=safe, 1=explicit)")
+    nsfw_score: float = Field(
+        description="NSFW content score 0.0-1.0 (0=safe, 1=explicit)"
+    )
     quality_score: float = Field(description="Technical quality score 0.0-1.0")
     title: str = Field(description="A short, descriptive title for the image")
     brief: str = Field(description="A brief one-sentence description")
@@ -218,5 +222,9 @@ class AggregateStats:
         else:
             self.failed_requests += 1
             if stats.error:
-                error_type = type(stats.error).__name__ if isinstance(stats.error, Exception) else str(stats.error)[:50]
+                error_type = (
+                    type(stats.error).__name__
+                    if isinstance(stats.error, Exception)
+                    else str(stats.error)[:50]
+                )
                 self.errors[error_type] = self.errors.get(error_type, 0) + 1

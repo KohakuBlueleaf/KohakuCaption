@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 class RateLimitError(Exception):
     """Raised when API returns 429 rate limit error."""
+
     pass
 
 
@@ -167,18 +168,22 @@ class MLLMClient(ABC):
         messages = []
 
         if system_prompt:
-            messages.append({
-                "role": "system",
-                "content": system_prompt,
-            })
+            messages.append(
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                }
+            )
 
-        messages.append({
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                self._build_image_content(image),
-            ],
-        })
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    self._build_image_content(image),
+                ],
+            }
+        )
 
         return messages
 
@@ -197,7 +202,9 @@ class MLLMClient(ABC):
         Returns:
             Tuple of (response_content, retries_used)
         """
-        max_retries = max_retries if max_retries is not None else self.config.max_retries
+        max_retries = (
+            max_retries if max_retries is not None else self.config.max_retries
+        )
         state = RetryState(delay=self.config.retry_delay)
         rate_limit_retries = 0
 

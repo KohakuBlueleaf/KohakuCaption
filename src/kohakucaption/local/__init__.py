@@ -2,7 +2,7 @@
 Local VLM inference backends.
 
 This module provides high-throughput local inference for Vision Language Models
-using optimized backends like vLLM and LMDeploy.
+using vLLM.
 
 Features over remote API:
 - Direct GPU control and multi-GPU support (tensor/pipeline parallelism)
@@ -15,7 +15,7 @@ Example:
     from kohakucaption.local import VLLMModel, VLLMConfig
 
     config = VLLMConfig(
-        model="llava-hf/llava-1.5-7b-hf",
+        model="google/gemma-3-4b-it",
         tensor_parallel_size=2,  # Use 2 GPUs
     )
 
@@ -25,7 +25,6 @@ Example:
 
 Available backends:
 - VLLMModel: High-throughput inference with vLLM
-- LMDeployModel: Optimized inference with LMDeploy (TurboMind/PyTorch)
 """
 
 from kohakucaption.local.base import (
@@ -42,23 +41,15 @@ from kohakucaption.local.preprocess import (
 
 # Lazy imports to avoid hard dependencies
 _vllm_classes = None
-_lmdeploy_classes = None
 
 
 def _get_vllm():
     global _vllm_classes
     if _vllm_classes is None:
         from kohakucaption.local.vllm import VLLMModel, VLLMConfig
+
         _vllm_classes = (VLLMModel, VLLMConfig)
     return _vllm_classes
-
-
-def _get_lmdeploy():
-    global _lmdeploy_classes
-    if _lmdeploy_classes is None:
-        from kohakucaption.local.lmdeploy import LMDeployModel, LMDeployConfig
-        _lmdeploy_classes = (LMDeployModel, LMDeployConfig)
-    return _lmdeploy_classes
 
 
 # Public API via property-like access
@@ -71,14 +62,6 @@ class _LazyLoader:
     def VLLMConfig(self):
         return _get_vllm()[1]
 
-    @property
-    def LMDeployModel(self):
-        return _get_lmdeploy()[0]
-
-    @property
-    def LMDeployConfig(self):
-        return _get_lmdeploy()[1]
-
 
 _lazy = _LazyLoader()
 
@@ -86,8 +69,6 @@ _lazy = _LazyLoader()
 def __getattr__(name: str):
     """Lazy load backend classes on first access."""
     if name in ("VLLMModel", "VLLMConfig"):
-        return getattr(_lazy, name)
-    if name in ("LMDeployModel", "LMDeployConfig"):
         return getattr(_lazy, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
@@ -105,6 +86,4 @@ __all__ = [
     # Backend classes (lazy loaded)
     "VLLMModel",
     "VLLMConfig",
-    "LMDeployModel",
-    "LMDeployConfig",
 ]

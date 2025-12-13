@@ -111,7 +111,9 @@ class DepthMapProvider(ContextProvider):
 
         if "stats" in item.data:
             stats = item.data["stats"]
-            lines.append(f"  Depth range: {stats.get('min', 'N/A')} - {stats.get('max', 'N/A')}")
+            lines.append(
+                f"  Depth range: {stats.get('min', 'N/A')} - {stats.get('max', 'N/A')}"
+            )
             if "mean" in stats:
                 lines.append(f"  Mean depth: {stats['mean']}")
 

@@ -35,7 +35,9 @@ class JsonFormat(OutputFormat):
         lines.append("")
         lines.append("Rules:")
         lines.append("- Respond ONLY with valid JSON, no markdown, no extra text")
-        lines.append("- Write in direct declarative sentences, never use 'this image shows' or similar")
+        lines.append(
+            "- Write in direct declarative sentences, never use 'this image shows' or similar"
+        )
 
         return "\n".join(lines)
 
