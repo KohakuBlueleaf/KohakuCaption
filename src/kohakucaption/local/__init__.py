@@ -15,7 +15,7 @@ Example:
     from kohakucaption.local import VLLMModel, VLLMConfig
 
     config = VLLMConfig(
-        model="google/gemma-3-4b-it",
+        model="unsloth/gemma-3-4b-it-FP8-Dynamic",
         tensor_parallel_size=2,  # Use 2 GPUs
     )
 

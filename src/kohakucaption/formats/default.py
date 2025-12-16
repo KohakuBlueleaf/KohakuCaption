@@ -2,10 +2,14 @@
 Default output format: # key\\nvalue format.
 """
 
-import re
 from typing import Any
 
 from kohakucaption.formats.base import FormatField, OutputFormat, ParseResult
+from kohakucaption.formats.state_machine import (
+    HashSectionMatcher,
+    StateMachineParser,
+    apply_type_conversions,
+)
 
 
 # Default fields for caption
@@ -42,24 +46,43 @@ class DefaultFormat(OutputFormat):
 
     def __init__(self, fields: list[FormatField] | None = None):
         self.fields = fields or DEFAULT_CAPTION_FIELDS
+        self._init_parser()
+
+    def _init_parser(self):
+        """Initialize the state machine parser."""
+        valid_fields = {f.name for f in self.fields}
+        self.matcher = HashSectionMatcher(valid_fields, case_sensitive=False)
+        self.parser = StateMachineParser(self.matcher)
+        self.type_map = {f.name: f.field_type for f in self.fields}
 
     def get_format_instruction(self) -> str:
         """Get format instruction for the prompt."""
-        lines = ["Respond in this exact format (# key followed by value on next line):"]
-        lines.append("")
+        # Build field names list for emphasis
+        field_names = [f.name for f in self.fields]
+
+        lines = [
+            "IMPORTANT: You MUST respond using EXACTLY this format with these EXACT field names:",
+            f"Required fields in order: {', '.join(field_names)}",
+            "",
+            "Format template:",
+        ]
 
         for f in self.fields:
             lines.append(f"# {f.name}")
-            if f.field_type == "float":
-                lines.append(f"<{f.description}>")
-            else:
-                lines.append(f"<{f.description}>")
+            lines.append(f"<{f.description}>")
             lines.append("")
 
-        lines.append("Rules:")
-        lines.append("- Each field starts with # followed by the field name")
-        lines.append("- Value goes on the next line(s) until the next # or end")
-        lines.append("- No extra formatting, no markdown, no JSON")
+        lines.append("STRICT RULES:")
+        lines.append(
+            f"- You MUST use EXACTLY these field names: {', '.join(field_names)}"
+        )
+        lines.append("- The FIRST line MUST be: # aesthetic_score")
+        lines.append(
+            "- Each field starts with # followed by the EXACT field name above"
+        )
+        lines.append("- Value goes on the next line(s) until the next # field or end")
+        lines.append("- Do NOT use any other field names or formats")
+        lines.append("- No markdown, no JSON, no extra formatting")
         lines.append(
             "- Write in direct declarative sentences, never use 'this image shows' or similar"
         )
@@ -71,66 +94,25 @@ class DefaultFormat(OutputFormat):
         return "\n".join(lines)
 
     def parse(self, output: str) -> ParseResult:
-        """Parse the # key / value format."""
+        """Parse the # key / value format using state machine."""
         try:
             output = output.strip()
-            data = {}
 
-            # Pattern to match # key followed by value
-            # Captures: key name and everything until next # or end
-            pattern = r"#\s*(\w+)\s*\n([\s\S]*?)(?=\n#\s*\w+|$)"
-            matches = re.findall(pattern, output)
+            # Parse using state machine
+            data = self.parser.parse_to_dict(output)
 
-            if not matches:
+            if not data:
                 return ParseResult(
                     success=False,
                     error="No valid # key / value pairs found",
                     raw=output,
                 )
 
-            for key, value in matches:
-                key = key.strip().lower()
-                value = value.strip()
-
-                # Find field definition
-                field_def = next((f for f in self.fields if f.name == key), None)
-
-                if field_def:
-                    # Convert type
-                    if field_def.field_type == "float":
-                        try:
-                            data[key] = float(value)
-                        except ValueError:
-                            # Try to extract number from text
-                            num_match = re.search(r"[\d.]+", value)
-                            if num_match:
-                                data[key] = float(num_match.group())
-                            else:
-                                data[key] = 0.0
-                    elif field_def.field_type == "int":
-                        try:
-                            data[key] = int(value)
-                        except ValueError:
-                            num_match = re.search(r"\d+", value)
-                            if num_match:
-                                data[key] = int(num_match.group())
-                            else:
-                                data[key] = 0
-                    elif field_def.field_type == "list":
-                        # Split by comma or newline
-                        items = re.split(r"[,\n]", value)
-                        data[key] = [item.strip() for item in items if item.strip()]
-                    else:
-                        data[key] = value
-                else:
-                    # Unknown field, store as string
-                    data[key] = value
+            # Apply type conversions
+            data = apply_type_conversions(data, self.type_map)
 
             # Check required fields
-            missing = []
-            for f in self.fields:
-                if f.required and f.name not in data:
-                    missing.append(f.name)
+            missing = [f.name for f in self.fields if f.required and f.name not in data]
 
             if missing:
                 return ParseResult(

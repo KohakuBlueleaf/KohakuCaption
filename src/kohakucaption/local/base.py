@@ -43,10 +43,15 @@ class LocalModelConfig:
     top_p: float = 0.95
     top_k: int = 50
     # Memory settings
-    gpu_memory_utilization: float = 0.9
+    gpu_memory_utilization: float = 0.95  # Use 95% VRAM for better KV cache
     # Model loading
     trust_remote_code: bool = True
     dtype: str = "auto"  # "auto", "float16", "bfloat16", "float32"
+    # Quantization settings
+    quantization: str | None = None  # "fp8" (W8A8), "fp8_w8a16", "awq", "gptq", etc.
+    kv_cache_dtype: str = (
+        "fp8"  # "auto", "fp8", "fp8_e4m3" - default fp8 for efficiency
+    )
 
 
 @dataclass

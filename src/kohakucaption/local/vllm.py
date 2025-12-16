@@ -106,7 +106,7 @@ def detect_model_family(model_name: str) -> str:
 class VLLMConfig(LocalModelConfig):
     """Configuration for vLLM inference."""
 
-    model: str = "google/gemma-3-4b-it"
+    model: str = "unsloth/gemma-3-4b-it-FP8-Dynamic"
     # vLLM specific
     max_model_len: int | None = None  # Auto if None
     max_num_seqs: int = 256  # Max concurrent sequences
@@ -131,7 +131,7 @@ class VLLMModel(LocalVLMBase):
 
     Example:
         config = VLLMConfig(
-            model="google/gemma-3-4b-it",
+            model="unsloth/gemma-3-4b-it-FP8-Dynamic",
             tensor_parallel_size=2,  # Use 2 GPUs
         )
         model = VLLMModel(config)
@@ -197,6 +197,14 @@ class VLLMModel(LocalVLMBase):
 
         if self.config.dtype != "auto":
             llm_kwargs["dtype"] = self.config.dtype
+
+        # Quantization: fp8 (W8A8), fp8_w8a16 (weight-only), awq, gptq, etc.
+        if self.config.quantization:
+            llm_kwargs["quantization"] = self.config.quantization
+
+        # KV cache dtype: fp8 for memory efficiency (2x KV cache capacity)
+        if self.config.kv_cache_dtype != "auto":
+            llm_kwargs["kv_cache_dtype"] = self.config.kv_cache_dtype
 
         if self.config.pipeline_parallel_size > 1:
             llm_kwargs["pipeline_parallel_size"] = self.config.pipeline_parallel_size
