@@ -1,31 +1,45 @@
 #!/usr/bin/env python3
 """
-ImageNet-1k Local Captioning Script.
+Batch Local Captioning Script using vLLM.
 
-Reads images from a tagged folder (output of imagenet_tagging.py) and generates captions
-using vLLM with proper format system (DefaultFormat).
+Generates captions for images in a folder (supports nested subfolders) using vLLM
+with the DefaultFormat system for structured output.
 
-Input folder structure:
-    <id>.jpg        - The image
-    <id>.tag.json   - Tags and metadata (from tagging script)
+Input folder structure (flat or nested):
+    folder/
+    ├── image1.jpg
+    ├── image1.tag.json    (optional - for --with-tags)
+    ├── subfolder/
+    │   ├── image2.png
+    │   └── image2.tag.json
+    └── ...
 
 Output:
-    <id>.caption.json - Generated caption with structured fields
+    <image_stem>.caption.json - Generated caption with structured fields
 
-Supports multi-GPU via --gpus flag (spawns subprocesses with correct CUDA_VISIBLE_DEVICES).
+Features:
+    - Supports nested folder structures (recursive image discovery)
+    - Multi-GPU data parallel via --gpus flag
+    - Tensor parallel for large models via --tensor-parallel
+    - FP8 KV cache and pre-quantized FP8 models for efficiency
+    - Memory leak mitigation via --restart-after
+    - Optional tag context from .tag.json files
 
 Usage:
-    # Single GPU
-    python scripts/imagenet_captioning.py -i ./imagenet_data --gpus 0
+    # Single GPU (flat folder)
+    python scripts/batch_caption_local.py -i ./images --gpus 0
 
-    # Multi-GPU (4 GPUs)
-    python scripts/imagenet_captioning.py -i ./imagenet_data --gpus 0,3,4,5
+    # Multi-GPU with nested folders
+    python scripts/batch_caption_local.py -i ./dataset --gpus 0,1,2,3
 
     # With tags as context
-    python scripts/imagenet_captioning.py -i ./imagenet_data --gpus 0,3,4,5 --with-tags
+    python scripts/batch_caption_local.py -i ./tagged_images --gpus 0,1 --with-tags
 
-    # Tensor parallel (single large model across GPUs)
-    python scripts/imagenet_captioning.py -i ./imagenet_data --tensor-parallel 4
+    # Tensor parallel for large models
+    python scripts/batch_caption_local.py -i ./images --tensor-parallel 4 -m google/gemma-3-27b-it
+
+    # With memory leak mitigation (restart workers every 50k samples)
+    python scripts/batch_caption_local.py -i ./large_dataset --gpus 0,1,2,3 --restart-after 50000
 """
 
 import json
@@ -69,7 +83,7 @@ def _signal_handler(signum, frame):
 
 
 # Default model
-DEFAULT_MODEL = "google/gemma-3-4b-it"
+DEFAULT_MODEL = "unsloth/gemma-3-4b-it-FP8-Dynamic"
 
 
 def pil_to_rgb(image: Image.Image) -> Image.Image:
@@ -121,31 +135,56 @@ class SpeedMonitor:
         return f"{eta_sec / 3600:.1f}h"
 
 
-def find_images(input_dir: Path) -> list[tuple[str, Path, Path]]:
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff"}
+
+
+def get_caption_path(input_dir: Path, image_id: str) -> Path:
+    """Get caption file path for an image ID, creating parent dirs if needed."""
+    caption_path = input_dir / f"{image_id}.caption.json"
+    caption_path.parent.mkdir(parents=True, exist_ok=True)
+    return caption_path
+
+
+def find_images(
+    input_dir: Path, recursive: bool = True
+) -> list[tuple[str, Path, Path | None]]:
     """
-    Find all images with corresponding tag files.
+    Find all images in a folder (optionally recursive).
 
     Returns list of (image_id, image_path, tag_path) tuples.
+    - image_id: unique identifier (relative path without extension for nested, stem for flat)
+    - image_path: full path to image
+    - tag_path: path to .tag.json file (may not exist)
+
+    For nested folders, image_id preserves directory structure with '/' separators.
     """
     results = []
 
-    # Find all tag.json files
-    tag_files = sorted(input_dir.glob("*.tag.json"))
+    # Find all image files
+    if recursive:
+        image_files = []
+        for ext in IMAGE_EXTENSIONS:
+            image_files.extend(input_dir.rglob(f"*{ext}"))
+            image_files.extend(input_dir.rglob(f"*{ext.upper()}"))
+    else:
+        image_files = []
+        for ext in IMAGE_EXTENSIONS:
+            image_files.extend(input_dir.glob(f"*{ext}"))
+            image_files.extend(input_dir.glob(f"*{ext.upper()}"))
 
-    for tag_path in tag_files:
-        # Extract image ID from tag filename
-        image_id = tag_path.name.replace(".tag.json", "")
+    # Remove duplicates and sort
+    image_files = sorted(set(image_files))
 
-        # Find corresponding image
-        image_path = None
-        for ext in [".jpg", ".jpeg", ".png", ".webp", ".JPEG", ".JPG", ".PNG"]:
-            candidate = input_dir / f"{image_id}{ext}"
-            if candidate.exists():
-                image_path = candidate
-                break
+    for image_path in image_files:
+        # Create unique image_id from relative path
+        rel_path = image_path.relative_to(input_dir)
+        # Use relative path without extension as ID (preserves folder structure)
+        image_id = str(rel_path.with_suffix(""))
 
-        if image_path:
-            results.append((image_id, image_path, tag_path))
+        # Look for corresponding tag file in same directory as image
+        tag_path = image_path.with_suffix(".tag.json")
+
+        results.append((image_id, image_path, tag_path))
 
     return results
 
@@ -201,6 +240,11 @@ def run_worker_subprocess(
     temperature: float,
     max_samples: int | None,
     skip_existing: bool,
+    gpu_memory_utilization: float,
+    kv_cache_dtype: str,
+    quantization: str,
+    restart_after: int | None = None,
+    recursive: bool = True,
 ) -> subprocess.Popen:
     """Spawn a worker subprocess with CUDA_VISIBLE_DEVICES set."""
     env = os.environ.copy()
@@ -223,6 +267,12 @@ def run_worker_subprocess(
         str(max_model_len),
         "--temperature",
         str(temperature),
+        "--gpu-memory-utilization",
+        str(gpu_memory_utilization),
+        "--kv-cache-dtype",
+        kv_cache_dtype,
+        "--quantization",
+        quantization,
         "--worker-rank",
         str(rank),
         "--worker-world-size",
@@ -233,8 +283,12 @@ def run_worker_subprocess(
         cmd.append("--with-tags")
     if not skip_existing:
         cmd.append("--no-skip-existing")
+    if not recursive:
+        cmd.append("--no-recursive")
     if max_samples is not None:
         cmd.extend(["--max-samples", str(max_samples)])
+    if restart_after is not None:
+        cmd.extend(["--restart-after", str(restart_after)])
 
     return subprocess.Popen(cmd, env=env)
 
@@ -252,6 +306,10 @@ def process_batch(
     temperature: float,
     rank: int,
     world_size: int,
+    gpu_memory_utilization: float = 0.95,
+    kv_cache_dtype: str = "fp8",
+    quantization: str | None = None,
+    restart_after: int | None = None,
 ) -> dict[str, int]:
     """
     Process images in batches using vLLM's batch inference.
@@ -281,7 +339,9 @@ def process_batch(
         max_tokens=max_tokens,
         max_model_len=max_model_len,
         temperature=temperature,
-        gpu_memory_utilization=0.9,
+        gpu_memory_utilization=gpu_memory_utilization,
+        kv_cache_dtype=kv_cache_dtype,
+        quantization=quantization if quantization else None,
     )
     model = VLLMModel(config)
 
@@ -352,93 +412,120 @@ def process_batch(
                 valid_images = [batch_images[i] for i in range(len(batch_images))]
                 valid_prompts = [batch_prompts[i] for i in range(len(batch_prompts))]
 
-                # Batch inference with vLLM - with error handling for CUDA errors
-                try:
-                    batch_output = model.generate_batch(valid_images, valid_prompts)
-                    batch_success = True
-                except Exception as e:
-                    error_msg = str(e)
-                    is_cuda_error = "CUDA" in error_msg or "cuda" in error_msg
-
-                    if is_cuda_error:
-                        logger.error(
-                            f"[GPU {gpu_id}] CUDA error during batch inference: {error_msg[:200]}"
-                        )
-                        logger.error(
-                            f"[GPU {gpu_id}] Marking {len(valid_images)} items as failed. "
-                            f"Restart with --skip-existing to continue."
-                        )
-                    else:
-                        logger.error(
-                            f"[GPU {gpu_id}] Batch inference error: {error_msg[:200]}"
-                        )
-
-                    # Mark all items in this batch as failed
-                    for image_id in batch_ids:
-                        caption_path = input_dir / f"{image_id}.caption.json"
-                        data = {
-                            "image_id": image_id,
-                            "error": f"Batch inference failed: {error_msg[:500]}",
-                        }
-                        with open(caption_path, "w", encoding="utf-8") as f:
-                            json.dump(data, f, indent=2, ensure_ascii=False)
-                        stats["failed"] += 1
-
-                    batch_success = False
-
-                    # For CUDA errors, we should stop as the GPU state may be corrupted
-                    if is_cuda_error:
-                        logger.error(
-                            f"[GPU {gpu_id}] Stopping due to CUDA error. "
-                            f"Restart with --skip-existing to resume."
-                        )
-                        _interrupted = True
+                # Batch inference with vLLM - with retry for non-CUDA errors
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        batch_output = model.generate_batch(valid_images, valid_prompts)
+                        batch_success = True
                         break
+                    except Exception as e:
+                        error_msg = str(e)
+                        is_cuda_error = "CUDA" in error_msg or "cuda" in error_msg
+
+                        if is_cuda_error:
+                            logger.error(
+                                f"[GPU {gpu_id}] CUDA error during batch inference: {error_msg[:200]}"
+                            )
+                            # Mark all items in this batch as failed
+                            stats["failed"] += len(batch_ids)
+                            batch_success = False
+                            logger.error(
+                                f"[GPU {gpu_id}] Stopping due to CUDA error. "
+                                f"Restart with --skip-existing to resume."
+                            )
+                            _interrupted = True
+                            break
+                        else:
+                            if attempt < max_retries - 1:
+                                logger.warning(
+                                    f"[GPU {gpu_id}] Batch inference error (attempt {attempt + 1}/{max_retries}): {error_msg[:100]}"
+                                )
+                                continue
+                            else:
+                                logger.error(
+                                    f"[GPU {gpu_id}] Batch inference failed after {max_retries} attempts: {error_msg[:200]}"
+                                )
+                                stats["failed"] += len(batch_ids)
+                                batch_success = False
+
+                if _interrupted:
+                    break
 
                 if batch_success:
-                    # Process results
+                    # Process results - retry parse errors individually
                     valid_idx = 0
                     for i, (image_id, error) in enumerate(zip(batch_ids, batch_errors)):
-                        caption_path = input_dir / f"{image_id}.caption.json"
-
                         if error:
-                            # Write error
-                            data = {"image_id": image_id, "error": error}
                             stats["failed"] += 1
+                            continue
+
+                        caption_path = get_caption_path(input_dir, image_id)
+                        gen_output = batch_output.outputs[valid_idx]
+                        valid_idx += 1
+
+                        parse_result = output_format.parse(gen_output.text)
+                        if parse_result.success:
+                            data = {
+                                "image_id": image_id,
+                                "caption": parse_result.data,
+                            }
+                            stats["success"] += 1
+                            with open(caption_path, "w", encoding="utf-8") as f:
+                                json.dump(data, f, indent=2, ensure_ascii=False)
                         else:
-                            # Parse output
-                            gen_output = batch_output.outputs[valid_idx]
-                            valid_idx += 1
-
-                            parse_result = output_format.parse(gen_output.text)
-                            if parse_result.success:
-                                data = {
-                                    "image_id": image_id,
-                                    "caption": parse_result.data,
-                                }
-                                stats["success"] += 1
-                            else:
-                                data = {
-                                    "image_id": image_id,
-                                    "raw": gen_output.text,
-                                    "parse_error": parse_result.error,
-                                }
+                            # Parse error - retry this single image
+                            retry_success = False
+                            last_raw_output = gen_output.text
+                            for retry in range(2):
+                                try:
+                                    retry_output = model.generate_batch(
+                                        [valid_images[i]], [valid_prompts[i]]
+                                    )
+                                    last_raw_output = retry_output.outputs[0].text
+                                    retry_parse = output_format.parse(last_raw_output)
+                                    if retry_parse.success:
+                                        data = {
+                                            "image_id": image_id,
+                                            "caption": retry_parse.data,
+                                        }
+                                        stats["success"] += 1
+                                        with open(
+                                            caption_path, "w", encoding="utf-8"
+                                        ) as f:
+                                            json.dump(
+                                                data, f, indent=2, ensure_ascii=False
+                                            )
+                                        retry_success = True
+                                        break
+                                except Exception:
+                                    pass
+                            if not retry_success:
                                 stats["failed"] += 1
-
-                        with open(caption_path, "w", encoding="utf-8") as f:
-                            json.dump(data, f, indent=2, ensure_ascii=False)
+                                # Write raw output to .caption.fail for debugging
+                                fail_path = input_dir / f"{image_id}.caption.fail"
+                                fail_path.parent.mkdir(parents=True, exist_ok=True)
+                                with open(fail_path, "w", encoding="utf-8") as f:
+                                    f.write(last_raw_output)
+                                logger.warning(
+                                    f"[GPU {gpu_id}] Parse error for {image_id} after retries"
+                                )
             else:
-                # All items in batch had errors
-                for image_id, error in zip(batch_ids, batch_errors):
-                    caption_path = input_dir / f"{image_id}.caption.json"
-                    data = {"image_id": image_id, "error": error or "Unknown error"}
-                    with open(caption_path, "w", encoding="utf-8") as f:
-                        json.dump(data, f, indent=2, ensure_ascii=False)
-                    stats["failed"] += 1
+                # All items in batch had errors - don't write files
+                stats["failed"] += len(batch_ids)
 
             speed.tick(len(batch_items))
             pbar.update(len(batch_items))
             update_pbar()
+
+            # Check if we should restart to avoid memory leaks
+            processed = stats["success"] + stats["failed"]
+            if restart_after is not None and processed >= restart_after:
+                logger.info(
+                    f"[GPU {gpu_id}] Processed {processed} samples, "
+                    f"restarting to avoid memory leaks..."
+                )
+                break
 
     except KeyboardInterrupt:
         logger.info(f"\n[GPU {gpu_id}] Interrupted!")
@@ -463,6 +550,9 @@ def process_tensor_parallel(
     max_tokens: int,
     max_model_len: int,
     temperature: float,
+    gpu_memory_utilization: float = 0.95,
+    kv_cache_dtype: str = "fp8",
+    quantization: str | None = None,
 ) -> dict[str, int]:
     """
     Process with tensor parallelism (single model across GPUs).
@@ -482,7 +572,9 @@ def process_tensor_parallel(
         max_tokens=max_tokens,
         max_model_len=max_model_len,
         temperature=temperature,
-        gpu_memory_utilization=0.9,
+        gpu_memory_utilization=gpu_memory_utilization,
+        kv_cache_dtype=kv_cache_dtype,
+        quantization=quantization if quantization else None,
     )
     model = VLLMModel(config)
 
@@ -544,83 +636,104 @@ def process_tensor_parallel(
                 valid_images = [batch_images[i] for i in range(len(batch_images))]
                 valid_prompts = [batch_prompts[i] for i in range(len(batch_prompts))]
 
-                # Batch inference with error handling
-                try:
-                    batch_output = model.generate_batch(valid_images, valid_prompts)
-                    batch_success = True
-                except Exception as e:
-                    error_msg = str(e)
-                    is_cuda_error = "CUDA" in error_msg or "cuda" in error_msg
-
-                    if is_cuda_error:
-                        logger.error(
-                            f"CUDA error during batch inference: {error_msg[:200]}"
-                        )
-                        logger.error(
-                            f"Marking {len(valid_images)} items as failed. "
-                            f"Restart with --skip-existing to continue."
-                        )
-                    else:
-                        logger.error(f"Batch inference error: {error_msg[:200]}")
-
-                    # Mark all items in this batch as failed
-                    for image_id in batch_ids:
-                        caption_path = input_dir / f"{image_id}.caption.json"
-                        data = {
-                            "image_id": image_id,
-                            "error": f"Batch inference failed: {error_msg[:500]}",
-                        }
-                        with open(caption_path, "w", encoding="utf-8") as f:
-                            json.dump(data, f, indent=2, ensure_ascii=False)
-                        stats["failed"] += 1
-
-                    batch_success = False
-
-                    # For CUDA errors, stop as GPU state may be corrupted
-                    if is_cuda_error:
-                        logger.error(
-                            "Stopping due to CUDA error. "
-                            "Restart with --skip-existing to resume."
-                        )
-                        _interrupted = True
+                # Batch inference with retry for non-CUDA errors
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        batch_output = model.generate_batch(valid_images, valid_prompts)
+                        batch_success = True
                         break
+                    except Exception as e:
+                        error_msg = str(e)
+                        is_cuda_error = "CUDA" in error_msg or "cuda" in error_msg
+
+                        if is_cuda_error:
+                            logger.error(
+                                f"CUDA error during batch inference: {error_msg[:200]}"
+                            )
+                            stats["failed"] += len(batch_ids)
+                            batch_success = False
+                            logger.error(
+                                "Stopping due to CUDA error. Restart with --skip-existing to resume."
+                            )
+                            _interrupted = True
+                            break
+                        else:
+                            if attempt < max_retries - 1:
+                                logger.warning(
+                                    f"Batch inference error (attempt {attempt + 1}/{max_retries}): {error_msg[:100]}"
+                                )
+                                continue
+                            else:
+                                logger.error(
+                                    f"Batch inference failed after {max_retries} attempts: {error_msg[:200]}"
+                                )
+                                stats["failed"] += len(batch_ids)
+                                batch_success = False
+
+                if _interrupted:
+                    break
 
                 if batch_success:
                     valid_idx = 0
                     for i, (image_id, error) in enumerate(zip(batch_ids, batch_errors)):
-                        caption_path = input_dir / f"{image_id}.caption.json"
-
                         if error:
-                            data = {"image_id": image_id, "error": error}
                             stats["failed"] += 1
+                            continue
+
+                        caption_path = get_caption_path(input_dir, image_id)
+                        gen_output = batch_output.outputs[valid_idx]
+                        valid_idx += 1
+
+                        parse_result = output_format.parse(gen_output.text)
+                        if parse_result.success:
+                            data = {
+                                "image_id": image_id,
+                                "caption": parse_result.data,
+                            }
+                            stats["success"] += 1
+                            with open(caption_path, "w", encoding="utf-8") as f:
+                                json.dump(data, f, indent=2, ensure_ascii=False)
                         else:
-                            gen_output = batch_output.outputs[valid_idx]
-                            valid_idx += 1
-
-                            parse_result = output_format.parse(gen_output.text)
-                            if parse_result.success:
-                                data = {
-                                    "image_id": image_id,
-                                    "caption": parse_result.data,
-                                }
-                                stats["success"] += 1
-                            else:
-                                data = {
-                                    "image_id": image_id,
-                                    "raw": gen_output.text,
-                                    "parse_error": parse_result.error,
-                                }
+                            # Parse error - retry this single image
+                            retry_success = False
+                            last_raw_output = gen_output.text
+                            for retry in range(2):
+                                try:
+                                    retry_output = model.generate_batch(
+                                        [valid_images[i]], [valid_prompts[i]]
+                                    )
+                                    last_raw_output = retry_output.outputs[0].text
+                                    retry_parse = output_format.parse(last_raw_output)
+                                    if retry_parse.success:
+                                        data = {
+                                            "image_id": image_id,
+                                            "caption": retry_parse.data,
+                                        }
+                                        stats["success"] += 1
+                                        with open(
+                                            caption_path, "w", encoding="utf-8"
+                                        ) as f:
+                                            json.dump(
+                                                data, f, indent=2, ensure_ascii=False
+                                            )
+                                        retry_success = True
+                                        break
+                                except Exception:
+                                    pass
+                            if not retry_success:
                                 stats["failed"] += 1
-
-                        with open(caption_path, "w", encoding="utf-8") as f:
-                            json.dump(data, f, indent=2, ensure_ascii=False)
+                                # Write raw output to .caption.fail for debugging
+                                fail_path = input_dir / f"{image_id}.caption.fail"
+                                fail_path.parent.mkdir(parents=True, exist_ok=True)
+                                with open(fail_path, "w", encoding="utf-8") as f:
+                                    f.write(last_raw_output)
+                                logger.warning(
+                                    f"Parse error for {image_id} after retries"
+                                )
             else:
-                for image_id, error in zip(batch_ids, batch_errors):
-                    caption_path = input_dir / f"{image_id}.caption.json"
-                    data = {"image_id": image_id, "error": error or "Unknown error"}
-                    with open(caption_path, "w", encoding="utf-8") as f:
-                        json.dump(data, f, indent=2, ensure_ascii=False)
-                    stats["failed"] += 1
+                # All items in batch had errors - don't write files
+                stats["failed"] += len(batch_ids)
 
             speed.tick(len(batch_items))
             pbar.update(len(batch_items))
@@ -643,7 +756,13 @@ def process_tensor_parallel(
     "-i",
     type=click.Path(exists=True, file_okay=False, path_type=Path),
     required=True,
-    help="Input directory containing images and tag.json files",
+    help="Input directory containing images (supports nested folders)",
+)
+@click.option(
+    "--recursive/--no-recursive",
+    default=True,
+    show_default=True,
+    help="Recursively search for images in subdirectories",
 )
 @click.option(
     "--model",
@@ -651,9 +770,9 @@ def process_tensor_parallel(
     type=str,
     default=None,
     help=(
-        "Model name/path. Default: google/gemma-3-4b-it. "
-        "Gemma3 models: gemma-3-4b-it, gemma-3-12b-it, gemma-3-27b-it. "
-        "Gemma3n models: gemma-3n-E2B-it (2B active), gemma-3n-E4B-it (4B active)."
+        "Model name/path. Default: unsloth/gemma-3-4b-it-FP8-Dynamic. "
+        "Gemma3 FP8: unsloth/gemma-3-4b-it-FP8-Dynamic, unsloth/gemma-3-12b-it-FP8-Dynamic. "
+        "Gemma3 BF16: google/gemma-3-4b-it, google/gemma-3-12b-it, google/gemma-3-27b-it."
     ),
 )
 @click.option(
@@ -719,6 +838,33 @@ def process_tensor_parallel(
     help="Skip already processed samples",
 )
 @click.option(
+    "--gpu-memory-utilization",
+    type=float,
+    default=0.95,
+    show_default=True,
+    help="GPU memory utilization (0.0-1.0). Higher = more KV cache space",
+)
+@click.option(
+    "--kv-cache-dtype",
+    type=click.Choice(["auto", "fp8", "fp8_e4m3"]),
+    default="fp8",
+    show_default=True,
+    help="KV cache dtype. fp8 gives 2x cache capacity with minimal quality loss",
+)
+@click.option(
+    "--quantization",
+    type=click.Choice(["none", "fp8", "fp8_w8a16"]),
+    default="none",
+    show_default=True,
+    help="Weight quantization: none (default), fp8 (W8A8 true FP8), fp8_w8a16 (weight-only)",
+)
+@click.option(
+    "--restart-after",
+    type=int,
+    default=None,
+    help="Restart worker after processing N samples to avoid memory leaks (e.g., 50000)",
+)
+@click.option(
     "--worker-rank",
     type=int,
     default=None,
@@ -734,6 +880,7 @@ def process_tensor_parallel(
 )
 def main(
     input_dir: Path,
+    recursive: bool,
     model: str | None,
     gpus: str,
     tensor_parallel: int | None,
@@ -744,23 +891,32 @@ def main(
     temperature: float,
     max_samples: int | None,
     skip_existing: bool,
+    gpu_memory_utilization: float,
+    kv_cache_dtype: str,
+    quantization: str,
+    restart_after: int | None,
     worker_rank: int | None,
     worker_world_size: int | None,
 ):
     """
-    Caption images from a tagged folder using vLLM.
+    Batch caption images using local vLLM inference.
 
-    Uses the DefaultFormat system to generate structured captions with:
+    Generates structured captions for images in a folder (supports nested subfolders).
+    Uses the DefaultFormat system for structured output with:
     - aesthetic_score, nsfw_score, quality_score
     - title, brief, description
 
     \b
-    Input structure:
-        <id>.jpg        - The image
-        <id>.tag.json   - Tags (from tagging script)
+    Input structure (flat or nested):
+        folder/
+        ├── image1.jpg
+        ├── image1.tag.json    (optional)
+        ├── subfolder/
+        │   └── image2.png
+        └── ...
 
     Output:
-        <id>.caption.json - Generated caption with structured fields
+        <relative_path>.caption.json - Generated caption (same location as image)
 
     \b
     Parallelism modes:
@@ -769,14 +925,14 @@ def main(
 
     \b
     Examples:
-        # Single GPU
-        python scripts/imagenet_captioning.py -i ./imagenet_data --gpus 0
+        # Single GPU (flat folder)
+        python scripts/batch_caption_local.py -i ./images --gpus 0
 
-        # Multi-GPU (data parallel)
-        python scripts/imagenet_captioning.py -i ./imagenet_data --gpus 0,3,4,5
+        # Multi-GPU with nested folders
+        python scripts/batch_caption_local.py -i ./dataset --gpus 0,1,2,3
 
         # With tags as context
-        python scripts/imagenet_captioning.py -i ./imagenet_data --gpus 0,3,4,5 --with-tags
+        python scripts/batch_caption_local.py -i ./tagged_images --gpus 0,1 --with-tags
 
         # Tensor parallel (for large models like gemma-3-27b-it)
         python scripts/imagenet_captioning.py -i ./imagenet_data --tensor-parallel 4 -m google/gemma-3-27b-it
@@ -805,7 +961,7 @@ def main(
 
     if is_worker:
         # Worker subprocess: process our shard
-        image_items = find_images(input_dir)
+        image_items = find_images(input_dir, recursive=recursive)
 
         if max_samples is not None:
             image_items = image_items[:max_samples]
@@ -814,11 +970,16 @@ def main(
             image_items = [
                 item
                 for item in image_items
-                if not (input_dir / f"{item[0]}.caption.json").exists()
+                if not (
+                    input_dir / f"{item[0]}.caption.json"
+                ).exists()  # item[0] is image_id
             ]
 
         if not image_items:
             return
+
+        # Convert "none" to None for quantization
+        quant = None if quantization == "none" else quantization
 
         process_batch(
             image_items=image_items,
@@ -833,10 +994,17 @@ def main(
             temperature=temperature,
             rank=worker_rank,
             world_size=worker_world_size,
+            gpu_memory_utilization=gpu_memory_utilization,
+            kv_cache_dtype=kv_cache_dtype,
+            quantization=quant,
+            restart_after=restart_after,
         )
 
     elif tensor_parallel:
         # Tensor parallel mode
+        # Convert "none" to None for quantization
+        quant = None if quantization == "none" else quantization
+
         _run_tensor_parallel(
             input_dir=input_dir,
             model=model,
@@ -850,6 +1018,10 @@ def main(
             temperature=temperature,
             max_samples=max_samples,
             skip_existing=skip_existing,
+            gpu_memory_utilization=gpu_memory_utilization,
+            kv_cache_dtype=kv_cache_dtype,
+            quantization=quant,
+            recursive=recursive,
         )
 
     elif len(gpu_ids) > 1:
@@ -865,16 +1037,21 @@ def main(
             temperature=temperature,
             max_samples=max_samples,
             skip_existing=skip_existing,
+            gpu_memory_utilization=gpu_memory_utilization,
+            kv_cache_dtype=kv_cache_dtype,
+            quantization=quantization,
+            restart_after=restart_after,
+            recursive=recursive,
         )
 
     else:
         # Single GPU
         os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids[0]
 
-        image_items = find_images(input_dir)
+        image_items = find_images(input_dir, recursive=recursive)
 
         if not image_items:
-            click.echo("No images found! Make sure to run imagenet_tagging.py first.")
+            click.echo("No images found in the input directory.")
             return
 
         if max_samples is not None:
@@ -885,7 +1062,9 @@ def main(
             image_items = [
                 item
                 for item in image_items
-                if not (input_dir / f"{item[0]}.caption.json").exists()
+                if not (
+                    input_dir / f"{item[0]}.caption.json"
+                ).exists()  # item[0] is image_id
             ]
             skipped = original - len(image_items)
             if skipped > 0:
@@ -895,14 +1074,23 @@ def main(
             click.echo("All samples already processed!")
             return
 
+        # Convert "none" to None for quantization
+        quant = None if quantization == "none" else quantization
+
         # Print config
         click.echo("=" * 60)
-        click.echo("ImageNet-1k Captioning")
+        click.echo("Batch Captioning")
         click.echo("=" * 60)
         click.echo(f"Input: {input_dir} | Samples: {len(image_items)}")
         click.echo(f"Model: {model}")
         click.echo(f"Mode: Single GPU | Batch size: {batch_size}")
         click.echo(f"With tags: {with_tags} | Max tokens: {max_tokens}")
+        quant_display = (
+            quantization if quantization != "none" else "none (use pre-quantized model)"
+        )
+        click.echo(
+            f"GPU Mem: {gpu_memory_utilization:.0%} | KV Cache: {kv_cache_dtype} | Quant: {quant_display}"
+        )
         click.echo("=" * 60)
 
         start_time = time.time()
@@ -920,6 +1108,10 @@ def main(
             temperature=temperature,
             rank=0,
             world_size=1,
+            gpu_memory_utilization=gpu_memory_utilization,
+            kv_cache_dtype=kv_cache_dtype,
+            quantization=quant,
+            restart_after=restart_after,
         )
 
         elapsed = time.time() - start_time
@@ -945,6 +1137,11 @@ def _run_multi_gpu(
     temperature: float,
     max_samples: int | None,
     skip_existing: bool,
+    gpu_memory_utilization: float,
+    kv_cache_dtype: str,
+    quantization: str,
+    restart_after: int | None = None,
+    recursive: bool = True,
 ):
     """Main process: spawn worker subprocesses for each GPU."""
     start_time = time.time()
@@ -952,11 +1149,11 @@ def _run_multi_gpu(
 
     # Find and filter images first (so all workers see same list)
     logger.info(f"Scanning {input_dir} for images...")
-    image_items = find_images(input_dir)
+    image_items = find_images(input_dir, recursive=recursive)
     logger.info(f"Found {len(image_items)} images with tags")
 
     if not image_items:
-        click.echo("No images found! Make sure to run imagenet_tagging.py first.")
+        click.echo("No images found in the input directory.")
         return
 
     if max_samples is not None:
@@ -967,7 +1164,9 @@ def _run_multi_gpu(
         image_items = [
             item
             for item in image_items
-            if not (input_dir / f"{item[0]}.caption.json").exists()
+            if not (
+                input_dir / f"{item[0]}.caption.json"
+            ).exists()  # item[0] is image_id
         ]
         skipped = original - len(image_items)
         if skipped > 0:
@@ -979,38 +1178,84 @@ def _run_multi_gpu(
 
     # Print config
     click.echo("=" * 60)
-    click.echo("ImageNet-1k Captioning")
+    click.echo("Batch Captioning")
     click.echo("=" * 60)
     click.echo(f"Input: {input_dir} | Samples: {len(image_items)}")
     click.echo(f"Model: {model}")
     click.echo(f"Mode: Data Parallel | GPUs: {gpu_ids} | Batch size: {batch_size}")
     click.echo(f"With tags: {with_tags} | Max tokens: {max_tokens}")
+    quant_display = (
+        quantization if quantization != "none" else "none (use pre-quantized model)"
+    )
+    click.echo(
+        f"GPU Mem: {gpu_memory_utilization:.0%} | KV Cache: {kv_cache_dtype} | Quant: {quant_display}"
+    )
+    if restart_after:
+        click.echo(
+            f"Restart after: {restart_after} samples per worker (memory leak mitigation)"
+        )
     click.echo("=" * 60)
 
-    # Spawn worker subprocesses
-    processes = []
-    for rank, gpu_id in enumerate(gpu_ids):
-        p = run_worker_subprocess(
-            gpu_id=gpu_id,
-            rank=rank,
-            world_size=world_size,
-            input_dir=input_dir,
-            model=model,
-            with_tags=with_tags,
-            batch_size=batch_size,
-            max_tokens=max_tokens,
-            max_model_len=max_model_len,
-            temperature=temperature,
-            max_samples=max_samples,
-            skip_existing=skip_existing,
-        )
-        processes.append(p)
-        logger.info(f"Spawned worker on GPU {gpu_id} (rank {rank}/{world_size})")
-
-    # Wait for all workers
+    # Restart loop for memory leak mitigation
+    iteration = 0
     try:
-        for p in processes:
-            p.wait()
+        while True:
+            iteration += 1
+
+            # Re-check remaining samples (with skip_existing always True in restart mode)
+            if restart_after and iteration > 1:
+                remaining_items = [
+                    item
+                    for item in image_items
+                    if not (
+                        input_dir / f"{item[0]}.caption.json"
+                    ).exists()  # item[0] is image_id
+                ]
+                if not remaining_items:
+                    logger.info("All samples processed!")
+                    break
+                logger.info(
+                    f"Restart iteration {iteration}: {len(remaining_items)} samples remaining"
+                )
+
+            # Spawn worker subprocesses
+            processes = []
+            for rank, gpu_id in enumerate(gpu_ids):
+                p = run_worker_subprocess(
+                    gpu_id=gpu_id,
+                    rank=rank,
+                    world_size=world_size,
+                    input_dir=input_dir,
+                    model=model,
+                    with_tags=with_tags,
+                    batch_size=batch_size,
+                    max_tokens=max_tokens,
+                    max_model_len=max_model_len,
+                    temperature=temperature,
+                    max_samples=max_samples,
+                    skip_existing=(
+                        True if restart_after else skip_existing
+                    ),  # Always skip in restart mode
+                    gpu_memory_utilization=gpu_memory_utilization,
+                    kv_cache_dtype=kv_cache_dtype,
+                    quantization=quantization,
+                    restart_after=restart_after,
+                    recursive=recursive,
+                )
+                processes.append(p)
+                if iteration == 1:
+                    logger.info(
+                        f"Spawned worker on GPU {gpu_id} (rank {rank}/{world_size})"
+                    )
+
+            # Wait for all workers
+            for p in processes:
+                p.wait()
+
+            # If no restart_after, exit after one iteration
+            if not restart_after:
+                break
+
     except KeyboardInterrupt:
         logger.info("\nInterrupted! Terminating workers...")
         for p in processes:
@@ -1038,17 +1283,21 @@ def _run_tensor_parallel(
     temperature: float,
     max_samples: int | None,
     skip_existing: bool,
+    gpu_memory_utilization: float,
+    kv_cache_dtype: str,
+    quantization: str | None,
+    recursive: bool = True,
 ):
     """Tensor parallel mode: single model across GPUs."""
     start_time = time.time()
 
     # Find images
     logger.info(f"Scanning {input_dir} for images...")
-    image_items = find_images(input_dir)
+    image_items = find_images(input_dir, recursive=recursive)
     logger.info(f"Found {len(image_items)} images with tags")
 
     if not image_items:
-        click.echo("No images found! Make sure to run imagenet_tagging.py first.")
+        click.echo("No images found in the input directory.")
         return
 
     if max_samples is not None:
@@ -1059,7 +1308,9 @@ def _run_tensor_parallel(
         image_items = [
             item
             for item in image_items
-            if not (input_dir / f"{item[0]}.caption.json").exists()
+            if not (
+                input_dir / f"{item[0]}.caption.json"
+            ).exists()  # item[0] is image_id
         ]
         skipped = original - len(image_items)
         if skipped > 0:
@@ -1070,8 +1321,9 @@ def _run_tensor_parallel(
         return
 
     # Print config
+    quant_str = quantization if quantization else "none"
     click.echo("=" * 60)
-    click.echo("ImageNet-1k Captioning")
+    click.echo("Batch Captioning")
     click.echo("=" * 60)
     click.echo(f"Input: {input_dir} | Samples: {len(image_items)}")
     click.echo(f"Model: {model}")
@@ -1079,6 +1331,12 @@ def _run_tensor_parallel(
         f"Mode: Tensor Parallel | TP Size: {tensor_parallel} | Batch size: {batch_size}"
     )
     click.echo(f"With tags: {with_tags} | Max tokens: {max_tokens}")
+    quant_display = (
+        quant_str if quant_str != "none" else "none (use pre-quantized model)"
+    )
+    click.echo(
+        f"GPU Mem: {gpu_memory_utilization:.0%} | KV Cache: {kv_cache_dtype} | Quant: {quant_display}"
+    )
     click.echo("=" * 60)
 
     # Process
@@ -1094,6 +1352,9 @@ def _run_tensor_parallel(
         max_tokens=max_tokens,
         max_model_len=max_model_len,
         temperature=temperature,
+        gpu_memory_utilization=gpu_memory_utilization,
+        kv_cache_dtype=kv_cache_dtype,
+        quantization=quantization,
     )
 
     elapsed = time.time() - start_time

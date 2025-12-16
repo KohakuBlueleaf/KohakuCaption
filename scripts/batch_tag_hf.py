@@ -1,22 +1,36 @@
 #!/usr/bin/env python3
 """
-ImageNet-1k Tagging Script using HuggingFace Datasets.
+Batch Tagging Script for HuggingFace Datasets.
 
-Saves images and tags to output folder with structure:
-    <split>_<id>.jpg        - The image
-    <split>_<id>.tag.json   - Tags and metadata
+Downloads images from a HuggingFace dataset and tags them using AnimeTIMM tagger.
+Saves images and tags to output folder.
 
-Supports multi-GPU via torchrun (DDP-style data sharding).
+Output structure:
+    <prefix>_<id>.jpg        - The image
+    <prefix>_<id>.tag.json   - Tags and metadata
+
+Features:
+    - Supports any HuggingFace dataset with image column
+    - Configurable image column and ID column names
+    - Multi-GPU via torchrun (DDP-style data sharding)
+    - Automatic unique ID generation for datasets without ID column
 
 Usage:
-    # Single GPU
-    python scripts/imagenet_tagging.py -o ./imagenet_processed
+    # ImageNet-1k (default)
+    python scripts/batch_tag_hf.py -o ./imagenet_data
+
+    # Custom dataset with specified columns
+    python scripts/batch_tag_hf.py -o ./output --dataset "username/my-dataset" \\
+        --image-col "image" --id-col "file_name"
+
+    # Dataset without ID column (uses index)
+    python scripts/batch_tag_hf.py -o ./output --dataset "username/dataset" --image-col "img"
 
     # Multi-GPU (4 GPUs) via torchrun
-    torchrun --nproc_per_node=4 scripts/imagenet_tagging.py -o ./imagenet_processed
+    torchrun --nproc_per_node=4 scripts/batch_tag_hf.py -o ./output
 
     # Specific GPUs
-    CUDA_VISIBLE_DEVICES=0,3,4,5 torchrun --nproc_per_node=4 scripts/imagenet_tagging.py -o ./imagenet_processed
+    CUDA_VISIBLE_DEVICES=0,3,4,5 torchrun --nproc_per_node=4 scripts/batch_tag_hf.py -o ./output
 """
 
 import json
@@ -97,8 +111,19 @@ def pil_to_rgb(image: Image.Image) -> Image.Image:
         return image.convert("RGB")
 
 
-def make_image_id(split: str, index: int) -> str:
-    """Create unique image ID with split prefix."""
+def make_image_id(split: str, index: int, id_value: str | None = None) -> str:
+    """Create unique image ID.
+
+    If id_value is provided, sanitize and use it directly.
+    Otherwise, create ID with split prefix and zero-padded index.
+    """
+    if id_value is not None:
+        # Sanitize: replace path separators and spaces with underscores
+        sanitized = str(id_value).replace("/", "_").replace("\\", "_").replace(" ", "_")
+        # Remove file extension if present
+        if "." in sanitized:
+            sanitized = sanitized.rsplit(".", 1)[0]
+        return sanitized
     prefix = SPLIT_PREFIXES.get(split, split)
     return f"{prefix}_{index:08d}"
 
@@ -137,25 +162,39 @@ class SpeedMonitor:
         return f"{eta_sec / 3600:.1f}h"
 
 
-class ImageNetTaggingDataset(Dataset):
-    """Dataset for ImageNet tagging that returns preprocessed tensors."""
+class HFTaggingDataset(Dataset):
+    """Dataset for HuggingFace dataset tagging that returns preprocessed tensors."""
 
-    def __init__(self, hf_dataset, indices: list[int], transform, split: str):
+    def __init__(
+        self,
+        hf_dataset,
+        indices: list[int],
+        transform,
+        split: str,
+        image_col: str = "image",
+        id_col: str | None = None,
+    ):
         self.hf_dataset = hf_dataset
         self.indices = indices
         self.transform = transform
         self.split = split
+        self.image_col = image_col
+        self.id_col = id_col
 
     def __len__(self):
         return len(self.indices)
 
     def __getitem__(self, idx):
         actual_idx = self.indices[idx]
-        image_id = make_image_id(self.split, actual_idx)
         try:
             item = self.hf_dataset[actual_idx]
-            image = item["image"]
-            label = item["label"]
+            # Get ID from column or generate from index
+            id_value = item.get(self.id_col) if self.id_col else None
+            image_id = make_image_id(self.split, actual_idx, id_value)
+            # Get image from configured column
+            image = item[self.image_col]
+            # Get label if available (for ImageNet compatibility)
+            label = item.get("label", -1)
             image_rgb = pil_to_rgb(image)
             tensor = self.transform(image_rgb)
             return {
@@ -167,6 +206,14 @@ class ImageNetTaggingDataset(Dataset):
                 "error": None,
             }
         except Exception as e:
+            # Generate ID even on error for tracking
+            id_value = None
+            try:
+                item = self.hf_dataset[actual_idx]
+                id_value = item.get(self.id_col) if self.id_col else None
+            except Exception:
+                pass
+            image_id = make_image_id(self.split, actual_idx, id_value)
             return {
                 "image_id": image_id,
                 "index": actual_idx,
@@ -238,12 +285,33 @@ def is_main_process(rank: int) -> bool:
     help="Output directory for images and tags",
 )
 @click.option(
+    "--dataset",
+    "-d",
+    type=str,
+    default="ILSVRC/imagenet-1k",
+    show_default=True,
+    help="HuggingFace dataset repo ID",
+)
+@click.option(
     "--split",
     "-s",
-    type=click.Choice(["train", "validation", "test"]),
+    type=str,
     default="train",
     show_default=True,
-    help="Dataset split to process",
+    help="Dataset split to process (e.g., train, validation, test)",
+)
+@click.option(
+    "--image-col",
+    type=str,
+    default="image",
+    show_default=True,
+    help="Name of the image column in the dataset",
+)
+@click.option(
+    "--id-col",
+    type=str,
+    default=None,
+    help="Name of the ID column (if not set, uses index with split prefix)",
 )
 @click.option(
     "--tagger-repo",
@@ -297,7 +365,10 @@ def is_main_process(rank: int) -> bool:
 )
 def main(
     output_dir: Path,
+    dataset: str,
     split: str,
+    image_col: str,
+    id_col: str | None,
     tagger_repo: str,
     batch_size: int,
     num_workers: int,
@@ -307,24 +378,28 @@ def main(
     image_quality: int,
 ):
     """
-    Tag ImageNet-1k images and save to output folder.
+    Tag images from a HuggingFace dataset and save to output folder.
 
     Output structure:
-        <split>_<id>.jpg        - The image (e.g., train_00000001.jpg)
-        <split>_<id>.tag.json   - Tags and metadata
+        <prefix>_<id>.jpg        - The image (e.g., train_00000001.jpg)
+        <prefix>_<id>.tag.json   - Tags and metadata
 
-    IDs are unique across splits (train_, val_, test_ prefixes).
+    If --id-col is not specified, generates IDs using: <split>_<index:08d>
 
     \b
     Examples:
-        # Single GPU
-        python scripts/imagenet_tagging.py -o ./imagenet_data
+        # ImageNet-1k (default) - single GPU
+        python scripts/batch_tag_hf.py -o ./imagenet_data
+
+        # Custom dataset with specified columns
+        python scripts/batch_tag_hf.py -o ./output -d "username/my-dataset" \\
+            --image-col "image" --id-col "file_name"
 
         # Multi-GPU (4 GPUs) via torchrun
-        torchrun --nproc_per_node=4 scripts/imagenet_tagging.py -o ./imagenet_data
+        torchrun --nproc_per_node=4 scripts/batch_tag_hf.py -o ./imagenet_data
 
         # Specific GPUs
-        CUDA_VISIBLE_DEVICES=0,3,4,5 torchrun --nproc_per_node=4 scripts/imagenet_tagging.py -o ./imagenet_data
+        CUDA_VISIBLE_DEVICES=0,3,4,5 torchrun --nproc_per_node=4 scripts/batch_tag_hf.py -o ./output
     """
     global _interrupted
 
@@ -338,7 +413,10 @@ def main(
     try:
         _run_tagging(
             output_dir=output_dir,
+            dataset_repo=dataset,
             split=split,
+            image_col=image_col,
+            id_col=id_col,
             tagger_repo=tagger_repo,
             batch_size=batch_size,
             num_workers=num_workers,
@@ -356,7 +434,10 @@ def main(
 
 def _run_tagging(
     output_dir: Path,
+    dataset_repo: str,
     split: str,
+    image_col: str,
+    id_col: str | None,
     tagger_repo: str,
     batch_size: int,
     num_workers: int,
@@ -385,9 +466,9 @@ def _run_tagging(
 
     # Load dataset
     if is_main_process(rank):
-        logger.info(f"Loading ImageNet-1k dataset (split={split})...")
-    dataset = load_dataset("ILSVRC/imagenet-1k", split=split, trust_remote_code=True)
-    total_samples = len(dataset)
+        logger.info(f"Loading dataset: {dataset_repo} (split={split})...")
+    hf_dataset = load_dataset(dataset_repo, split=split, trust_remote_code=True)
+    total_samples = len(hf_dataset)
     if is_main_process(rank):
         logger.info(f"Dataset loaded: {total_samples} samples")
 
@@ -397,14 +478,31 @@ def _run_tagging(
     else:
         indices = list(range(total_samples))
 
-    # Filter existing (using new ID format with split prefix)
+    # Filter existing
+    # Note: For datasets with custom ID columns, we need to check each item
+    # For index-based IDs, we can check directly
     if skip_existing:
         original = len(indices)
-        indices = [
-            idx
-            for idx in indices
-            if not (output_dir / f"{make_image_id(split, idx)}.tag.json").exists()
-        ]
+        if id_col is None:
+            # Index-based IDs - can check directly
+            indices = [
+                idx
+                for idx in indices
+                if not (output_dir / f"{make_image_id(split, idx)}.tag.json").exists()
+            ]
+        else:
+            # Custom ID column - need to check each item's ID
+            filtered_indices = []
+            for idx in indices:
+                try:
+                    item = hf_dataset[idx]
+                    id_value = item.get(id_col)
+                    image_id = make_image_id(split, idx, id_value)
+                    if not (output_dir / f"{image_id}.tag.json").exists():
+                        filtered_indices.append(idx)
+                except Exception:
+                    filtered_indices.append(idx)  # Include if can't check
+            indices = filtered_indices
         skipped = original - len(indices)
         if skipped > 0 and is_main_process(rank):
             logger.info(f"Skipping {skipped} already processed samples")
@@ -423,7 +521,9 @@ def _run_tagging(
         logger.info(f"Tagger loaded on {tagger.device}")
 
     # Create dataset and dataloader
-    torch_dataset = ImageNetTaggingDataset(dataset, indices, tagger._transform, split)
+    torch_dataset = HFTaggingDataset(
+        hf_dataset, indices, tagger._transform, split, image_col, id_col
+    )
 
     if world_size > 1:
         sampler = DistributedSampler(
@@ -449,9 +549,11 @@ def _run_tagging(
     # Print config (only main process)
     if is_main_process(rank):
         click.echo("=" * 60)
-        click.echo("ImageNet-1k Tagging")
+        click.echo("HuggingFace Dataset Tagging")
         click.echo("=" * 60)
+        click.echo(f"Dataset: {dataset_repo}")
         click.echo(f"Split: {split} | Total samples: {len(indices)}")
+        click.echo(f"Image col: {image_col} | ID col: {id_col or '(auto-generated)'}")
         click.echo(f"GPUs: {world_size} | Batch size/GPU: {batch_size}")
         click.echo(f"Workers/GPU: {num_workers} | Tagger: {tagger_repo}")
         click.echo(f"Format: {image_format}")
