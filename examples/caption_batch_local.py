@@ -113,7 +113,7 @@ def build_prompt_with_tags(base_prompt: str, tags: dict[str, Any] | None) -> str
     "-m",
     type=str,
     default=None,
-    help="Model name/path. Default: google/gemma-3-4b-it",
+    help="Model name/path. Default: unsloth/gemma-3-4b-it-FP8-Dynamic",
 )
 @click.option(
     "--tensor-parallel",
@@ -139,6 +139,27 @@ def build_prompt_with_tags(base_prompt: str, tags: dict[str, Any] | None) -> str
     help="Maximum model context length",
 )
 @click.option("--temperature", type=float, default=0.7, show_default=True)
+@click.option(
+    "--gpu-memory-utilization",
+    type=float,
+    default=0.95,
+    show_default=True,
+    help="GPU memory utilization (0.0-1.0). Higher = more KV cache space",
+)
+@click.option(
+    "--kv-cache-dtype",
+    type=click.Choice(["auto", "fp8", "fp8_e4m3"]),
+    default="fp8",
+    show_default=True,
+    help="KV cache dtype. fp8 gives 2x cache capacity with minimal quality loss",
+)
+@click.option(
+    "--quantization",
+    type=click.Choice(["none", "fp8", "fp8_w8a16"]),
+    default="none",
+    show_default=True,
+    help="Weight quantization: none (default), fp8 (W8A8 true FP8), fp8_w8a16 (weight-only)",
+)
 @click.option(
     "--load-tags/--no-load-tags",
     default=False,
@@ -177,6 +198,9 @@ def main(
     max_tokens: int,
     max_model_len: int,
     temperature: float,
+    gpu_memory_utilization: float,
+    kv_cache_dtype: str,
+    quantization: str,
     load_tags: bool,
     num_workers: int,
     prefetch: int,
@@ -245,7 +269,7 @@ def main(
 
     # Default model
     if model is None:
-        model = "google/gemma-3-4b-it"
+        model = "unsloth/gemma-3-4b-it-FP8-Dynamic"
 
     click.echo("=" * 60)
     click.echo(f"Model: {model} | TP: {tensor_parallel}")
@@ -255,12 +279,16 @@ def main(
     click.echo("=" * 60)
 
     # Create VLM model
+    quant = None if quantization == "none" else quantization
     config = VLLMConfig(
         model=model,
         tensor_parallel_size=tensor_parallel,
         max_tokens=max_tokens,
         max_model_len=max_model_len,
         temperature=temperature,
+        gpu_memory_utilization=gpu_memory_utilization,
+        kv_cache_dtype=kv_cache_dtype,
+        quantization=quant,
     )
     vlm = VLLMModel(config)
 
